@@ -1,0 +1,17 @@
+[
+  {
+    "address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "chain": "arbitrum",
+    "label": "USDC",
+    "isDeployed": true,
+    "bytecodeSize": 1852,
+    "ercStandard": "ERC-20",
+    "isCompatible": true,
+    "symbol": "USDC",
+    "name": "USD Coin",
+    "decimals": 6,
+    "balanceFormatted": "0.00",
+    "compatibilityNote": "Compatible: Successfully exposed standard ERC-20 interface (USDC, decimals 6). Pooled into active token registry.",
+    "scannedAt": 1795271462294
+  }
+]
