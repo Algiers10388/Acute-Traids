@@ -1,22 +1,26 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   FileCheck,
-  Camera,
-  CheckCircle2,
-  AlertCircle,
-  Zap,
+  AlertTriangle,
+  CreditCard,
   Landmark,
-  ShieldCheck,
-  RefreshCw,
-  Copy,
-  Check,
-  Eye,
-  RotateCw,
-  ArrowRight,
   Upload,
+  CheckCircle2,
+  RefreshCw,
+  Loader2,
+  Zap,
+  Clock,
+  ShieldCheck,
+  X,
+  Camera,
 } from 'lucide-react';
-import { FiatAccount, FiatTransaction } from '../types';
-import { depositPersonalCheck, CheckDepositInput } from '../services/fiatApi';
+import { CheckDepositRecord, FiatAccount } from '../types';
+import {
+  fiatFetch,
+  fetchCheckDeposits,
+  reconcileCheckDeposits,
+  submitCheckDeposit,
+} from '../services/fiatApi';
 import { formatCurrency } from '../utils/cryptoMath';
 
 interface CashCheckModalTabProps {
@@ -24,702 +28,772 @@ interface CashCheckModalTabProps {
   onAccountUpdated: (newAccount: FiatAccount, notificationMsg?: string) => void;
   onBotCashAdjusted?: (amountDelta: number) => void;
   botCash: number;
+  onSwitchToDeposit?: (method: 'CARD' | 'BANK') => void;
+}
+
+const MAX_RAW_FILE_BYTES = 20 * 1024 * 1024;
+const TARGET_MAX_DATA_URL_BYTES = 2 * 1024 * 1024;
+const MAX_DIMENSION_PX = 1600;
+const DIRECT_ALLOWED_MIME = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') resolve(reader.result);
+      else reject(new Error('Failed to read check image file.'));
+    };
+    reader.onerror = () => reject(new Error('Failed to read check image file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function estimateBase64Bytes(dataUrl: string): number {
+  const comma = dataUrl.indexOf(',');
+  const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  return Math.floor((b64.length * 3) / 4);
+}
+
+async function prepareCheckImage(file: File): Promise<{ dataUrl: string; byteSize: number }> {
+  const mime = (file.type || '').toLowerCase();
+  const isImage = mime.startsWith('image/') || /\.(jpe?g|png|webp|bmp|gif)$/i.test(file.name);
+  if (!isImage) {
+    throw new Error('Check image must be a JPEG, PNG, or WebP photo.');
+  }
+  if (file.size > MAX_RAW_FILE_BYTES) {
+    throw new Error('Selected image exceeds the 20 MB maximum file size.');
+  }
+
+  const rawDataUrl = await readFileAsDataUrl(file);
+  const rawBytes = estimateBase64Bytes(rawDataUrl);
+
+  // Convert/downscale large or non-JPEG images via canvas into crisp JPEG for Check 21 compatibility
+  const needsCanvasNormalize =
+    rawBytes > TARGET_MAX_DATA_URL_BYTES ||
+    (mime !== 'image/jpeg' && mime !== 'image/jpg') ||
+    !DIRECT_ALLOWED_MIME.has(mime);
+
+  if (needsCanvasNormalize && typeof document !== 'undefined') {
+    try {
+      const optimized = await new Promise<string>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const longest = Math.max(img.width || 1, img.height || 1);
+          const scale = longest > MAX_DIMENSION_PX ? MAX_DIMENSION_PX / longest : 1;
+          const width = Math.max(1, Math.round((img.width || 1) * scale));
+          const height = Math.max(1, Math.round((img.height || 1) * scale));
+
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            reject(new Error('Canvas unavailable'));
+            return;
+          }
+          // White backdrop avoids black background when converting transparent PNGs to JPEG
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.88));
+        };
+        img.onerror = () => reject(new Error('Image decode failed'));
+        img.src = rawDataUrl;
+      });
+      return { dataUrl: optimized, byteSize: estimateBase64Bytes(optimized) };
+    } catch {
+      // Fallback to raw dataUrl if it's already a supported MIME and within 8 MB
+      if (DIRECT_ALLOWED_MIME.has(mime) && rawBytes <= 8 * 1024 * 1024) {
+        return { dataUrl: rawDataUrl, byteSize: rawBytes };
+      }
+      throw new Error('Could not process check image. Please upload a standard JPEG or PNG photo.');
+    }
+  }
+
+  if (rawBytes > 8 * 1024 * 1024) {
+    throw new Error('Check image exceeds the 8 MB upload limit.');
+  }
+
+  return { dataUrl: rawDataUrl, byteSize: rawBytes };
+}
+
+function formatKb(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export const CashCheckModalTab: React.FC<CashCheckModalTabProps> = ({
   fiatAccount,
   onAccountUpdated,
   onBotCashAdjusted,
-  botCash,
+  onSwitchToDeposit,
 }) => {
-  // Check Form State
+  const [checkEnabled, setCheckEnabled] = useState<boolean | null>(null);
+  const [increaseEnv, setIncreaseEnv] = useState<'sandbox' | 'production' | null>(null);
+  const [increaseEnvNotice, setIncreaseEnvNotice] = useState<string | null>(null);
+  const [checks, setChecks] = useState<CheckDepositRecord[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState<boolean>(true);
+  const [reconciling, setReconciling] = useState<boolean>(false);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [processingSide, setProcessingSide] = useState<'front' | 'back' | null>(null);
+  const [dragSide, setDragSide] = useState<'front' | 'back' | null>(null);
+
+  const [amount, setAmount] = useState<string>('');
+  const [checkNumber, setCheckNumber] = useState<string>('');
   const [payerName, setPayerName] = useState<string>('');
   const [issuingBank, setIssuingBank] = useState<string>('');
-  const [routingNumber, setRoutingNumber] = useState<string>('');
-  const [accountNumber, setAccountNumber] = useState<string>('');
-  const [checkNumber, setCheckNumber] = useState<string>('');
-  const [amount, setAmount] = useState<string>('');
-  const [memo, setMemo] = useState<string>('');
-  const [settlementSpeed, setSettlementSpeed] = useState<'INSTANT' | 'STANDARD_CLEARING'>('INSTANT');
-  const [destinationTarget, setDestinationTarget] = useState<'BOT' | 'VAULT'>('BOT');
+  const [destination, setDestination] = useState<'TREASURY_VAULT' | 'BOT_MARGIN'>('TREASURY_VAULT');
+  const [frontImage, setFrontImage] = useState<string>('');
+  const [frontMeta, setFrontMeta] = useState<string>('');
+  const [backImage, setBackImage] = useState<string>('');
+  const [backMeta, setBackMeta] = useState<string>('');
   const [endorsementConfirmed, setEndorsementConfirmed] = useState<boolean>(false);
 
-  // Check Imagery Simulation
-  const [frontCaptured, setFrontCaptured] = useState<boolean>(false);
-  const [backCaptured, setBackCaptured] = useState<boolean>(false);
-  const [checkSide, setCheckSide] = useState<'FRONT' | 'BACK'>('FRONT');
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  // Execution & Feedback
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [clearedReceipt, setClearedReceipt] = useState<FiatTransaction | null>(null);
-  const [copiedHash, setCopiedHash] = useState<string | null>(null);
+  const loadConfigAndHistory = useCallback(async () => {
+    setLoadingHistory(true);
+    try {
+      const [cfgRes, list] = await Promise.all([
+        fiatFetch('/api/fiat/config')
+          .then((r) => r.json())
+          .catch(() => null),
+        fetchCheckDeposits(),
+      ]);
+      setCheckEnabled(Boolean(cfgRes?.rails?.check));
+      setIncreaseEnv(cfgRes?.rails?.increase?.env ?? null);
+      setIncreaseEnvNotice(cfgRes?.rails?.increase?.envNotice ?? null);
+      setChecks(list);
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, []);
 
-  const handleCashCheck = async (e: React.FormEvent) => {
+  useEffect(() => {
+    loadConfigAndHistory();
+  }, [loadConfigAndHistory]);
+
+  const applySelectedFile = async (side: 'front' | 'back', file: File) => {
+    setError(null);
+    setProcessingSide(side);
+    try {
+      const { dataUrl, byteSize } = await prepareCheckImage(file);
+      const label = `${file.name} (${formatKb(byteSize)})`;
+      if (side === 'front') {
+        setFrontImage(dataUrl);
+        setFrontMeta(label);
+      } else {
+        setBackImage(dataUrl);
+        setBackMeta(label);
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Could not process check image.');
+    } finally {
+      setProcessingSide(null);
+    }
+  };
+
+  const handleImagePick = async (side: 'front' | 'back', e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    await applySelectedFile(side, file);
+  };
+
+  const handleDrop = async (side: 'front' | 'back', e: React.DragEvent<HTMLLabelElement>) => {
     e.preventDefault();
-    setErrorMsg(null);
+    e.stopPropagation();
+    setDragSide(null);
+    if (!checkEnabled || submitting) return;
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      await applySelectedFile(side, file);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+
+    if (!checkEnabled) {
+      setError('Increase Check 21 credentials are not active on the server yet.');
+      return;
+    }
 
     const numAmount = parseFloat(amount);
-    if (isNaN(numAmount) || numAmount < 1.0) {
-      setErrorMsg('Minimum check cashing amount is $1.00 USD.');
+    if (!Number.isFinite(numAmount) || numAmount < 1 || numAmount > 25000) {
+      setError('Enter a valid check amount between $1.00 and $25,000.00 USD.');
       return;
     }
-
-    if (!payerName.trim()) {
-      setErrorMsg('Please specify the payer name written on the check.');
+    const cleanNum = checkNumber.trim();
+    if (!/^[A-Za-z0-9-]{1,32}$/.test(cleanNum)) {
+      setError('Enter a valid check number (1–32 letters, numbers, or hyphens).');
       return;
     }
-
-    const cleanRouting = routingNumber.replace(/\D/g, '');
-    if (cleanRouting.length !== 9) {
-      setErrorMsg('ABA Routing Number must be exactly 9 numeric digits.');
+    if (payerName.trim().length < 2) {
+      setError('Enter the payer / drawer name printed on the check.');
       return;
     }
-
-    if (!frontCaptured || !backCaptured) {
-      setErrorMsg('Both Front and Back photos of the check must be captured before submission.');
+    if (!frontImage || !backImage) {
+      setError('Upload clear photos of both the front and endorsed back of the check.');
       return;
     }
-
     if (!endorsementConfirmed) {
-      setErrorMsg('You must confirm the check is endorsed for mobile deposit.');
+      setError("Sign the back and write 'For Mobile Deposit Only', then confirm the endorsement box.");
       return;
     }
 
-    setIsLoading(true);
+    setSubmitting(true);
     try {
-      const input: CheckDepositInput = {
+      const prevBotAlloc = fiatAccount.allocatedToTrading || 0;
+      const res = await submitCheckDeposit({
         amount: numAmount,
+        checkNumber: cleanNum,
         payerName: payerName.trim(),
-        checkNumber: checkNumber.trim(),
-        routingNumber: cleanRouting,
-        accountNumber: accountNumber.trim(),
-        issuingBank: issuingBank.trim(),
-        settlementSpeed,
-        directToBot: destinationTarget === 'BOT',
-        endorsementConfirmed: true,
-        memo: memo.trim(),
-      };
+        issuingBank: issuingBank.trim() || undefined,
+        endorsementConfirmed,
+        destination,
+        frontImage,
+        backImage,
+        idempotencyKey:
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `chk-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      });
 
-      const res = await depositPersonalCheck(input);
       onAccountUpdated(res.account, res.message);
-      if (destinationTarget === 'BOT' && onBotCashAdjusted) {
-        onBotCashAdjusted(numAmount);
+      const deltaBot = (res.account?.allocatedToTrading || 0) - prevBotAlloc;
+      if (deltaBot > 0 && onBotCashAdjusted) {
+        onBotCashAdjusted(deltaBot);
       }
-      setClearedReceipt(res.transaction);
+
+      setChecks((prev) => [res.check, ...prev.filter((c) => c.id !== res.check.id)]);
+      setNotice(res.message);
+      setAmount('');
+      setCheckNumber('');
+      setPayerName('');
+      setIssuingBank('');
+      setFrontImage('');
+      setFrontMeta('');
+      setBackImage('');
+      setBackMeta('');
+      setEndorsementConfirmed(false);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Check cashing failed. Please verify check details.');
+      setError(err?.message || 'Check deposit submission failed.');
     } finally {
-      setIsLoading(false);
+      setSubmitting(false);
     }
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedHash(text);
-    setTimeout(() => setCopiedHash(null), 2500);
+  const handleReconcile = async () => {
+    setError(null);
+    setNotice(null);
+    setReconciling(true);
+    try {
+      const prevBotAlloc = fiatAccount.allocatedToTrading || 0;
+      const res = await reconcileCheckDeposits();
+      setChecks(res.checks || []);
+      onAccountUpdated(res.account, 'Check clearing statuses refreshed from Increase.');
+      const deltaBot = (res.account?.allocatedToTrading || 0) - prevBotAlloc;
+      if (deltaBot !== 0 && onBotCashAdjusted) {
+        onBotCashAdjusted(deltaBot);
+      }
+      setNotice('Refreshed live Check 21 clearing statuses from Increase.');
+    } catch (err: any) {
+      setError(err?.message || 'Failed to refresh check clearing status.');
+    } finally {
+      setReconciling(false);
+    }
   };
 
-  const numAmt = parseFloat(amount) || 0;
+  const dailyRemaining = Math.max(0, fiatAccount.dailyDepositLimit - fiatAccount.dailyDepositUsed);
+  const canInteract = checkEnabled === true && !submitting;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6 animate-in fade-in duration-200">
-      {/* Header Banner */}
-      <div className="p-5 rounded-2xl bg-gradient-to-r from-emerald-950/60 via-slate-900 to-slate-950 border border-emerald-500/40 shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-mono text-emerald-400 font-bold uppercase tracking-wider">
-            <FileCheck className="h-4 w-4" />
-            <span>Mobile Remote Deposit Capture (RDC)</span>
-            <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] border border-emerald-500/30">
-              0% Fee Instant Settlement
-            </span>
-          </div>
-          <h3 className="text-xl font-bold text-white mt-1">Cash a Personal Check</h3>
-          <p className="text-xs text-slate-300 max-w-xl mt-1">
-            Capture front and back check imagery with MICR line OCR parsing. Funds settle instantly directly into your{' '}
-            <strong className="text-emerald-300">Trading Bot active margin</strong> or Live USD Vault.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-3 bg-slate-950/80 px-4 py-3 rounded-xl border border-slate-800 text-xs font-mono shrink-0">
-          <div>
-            <div className="text-[10px] text-slate-400 uppercase">Daily Check Limit</div>
-            <div className="text-base font-bold text-white">$25,000.00 USD</div>
-          </div>
-          <div className="h-8 w-px bg-slate-800" />
-          <div>
-            <div className="text-[10px] text-slate-400 uppercase">Settlement Rail</div>
-            <div className="text-xs font-bold text-emerald-400 flex items-center gap-1">
-              <Zap className="h-3 w-3" />
-              <span>Real-Time (0s)</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Success Receipt Banner */}
-      {clearedReceipt && (
-        <div className="p-5 rounded-2xl bg-emerald-950/50 border border-emerald-500/60 shadow-2xl space-y-4">
-          <div className="flex items-start justify-between">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">
-                <CheckCircle2 className="h-6 w-6" />
-              </div>
-              <div>
-                <h4 className="text-base font-bold text-white flex items-center gap-2">
-                  <span>Personal Check Successfully Cashed & Cleared</span>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                    FUNDS AVAILABLE
-                  </span>
-                </h4>
-                <p className="text-xs text-slate-300 mt-0.5">
-                  {formatCurrency(clearedReceipt.amount)} has been credited to{' '}
-                  <strong className="text-emerald-300">
-                    {clearedReceipt.destinationName}
-                  </strong>
-                  . The funds are cleared and available immediately.
-                </p>
-              </div>
-            </div>
-            <button
-              onClick={() => setClearedReceipt(null)}
-              className="text-slate-400 hover:text-white text-xs px-2 py-1 rounded bg-slate-900 border border-slate-800"
+    <div className="max-w-4xl mx-auto space-y-5 animate-in fade-in duration-200">
+      {/* Processor Status Banner */}
+      <div
+        className={`p-5 rounded-2xl border shadow-xl space-y-3 ${
+          checkEnabled === true
+            ? 'bg-emerald-950/30 border-emerald-500/40'
+            : checkEnabled === false
+              ? 'bg-slate-900/90 border-amber-500/40'
+              : 'bg-slate-900/90 border-slate-700/60'
+        }`}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div
+              className={`p-2.5 rounded-xl border shrink-0 ${
+                checkEnabled === true
+                  ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400'
+                  : checkEnabled === false
+                    ? 'bg-amber-500/15 border-amber-500/40 text-amber-400'
+                    : 'bg-slate-800 border-slate-700 text-cyan-400'
+              }`}
             >
-              Deposit Another Check
-            </button>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800/80 text-xs">
-            <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <div className="text-[10px] text-slate-400 font-mono uppercase">Amount Cashed</div>
-              <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
-                +{formatCurrency(clearedReceipt.amount)}
-              </div>
+              {checkEnabled === null ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileCheck className="h-5 w-5" />}
             </div>
-            <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <div className="text-[10px] text-slate-400 font-mono uppercase">Destination</div>
-              <div className="text-xs font-bold text-white truncate mt-0.5">
-                {clearedReceipt.destinationName}
-              </div>
-            </div>
-            <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <div className="text-[10px] text-slate-400 font-mono uppercase">Settlement Rail</div>
-              <div className="text-xs font-bold text-emerald-400 mt-0.5">
-                Instant Ingo/RDC (0s)
-              </div>
-            </div>
-            <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-              <div className="text-[10px] text-slate-400 font-mono uppercase">Bot Active Margin</div>
-              <div className="text-base font-black text-cyan-400 font-mono mt-0.5">
-                {formatCurrency(botCash)}
-              </div>
-            </div>
-          </div>
-
-          <div className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between text-xs font-mono">
-            <div className="flex items-center gap-2 overflow-hidden">
-              <span className="text-[10px] text-slate-500 uppercase font-semibold">Digital RDC Endorsement Hash:</span>
-              <span className="text-cyan-400 truncate text-[11px] select-all">
-                {clearedReceipt.referenceHash}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => copyToClipboard(clearedReceipt.referenceHash)}
-              className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] shrink-0 ml-2 transition-all cursor-pointer"
-            >
-              {copiedHash === clearedReceipt.referenceHash ? (
-                <>
-                  <Check className="h-3 w-3 text-emerald-400" />
-                  <span>Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="h-3 w-3 text-slate-400" />
-                  <span>Copy Hash</span>
-                </>
-              )}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Error Alert */}
-      {errorMsg && (
-        <div className="p-3.5 rounded-xl bg-rose-950/40 border border-rose-500/40 text-rose-200 text-xs flex items-center gap-2.5">
-          <AlertCircle className="h-4 w-4 text-rose-400 shrink-0" />
-          <div className="flex-1 font-mono">{errorMsg}</div>
-        </div>
-      )}
-
-      {/* Remote Deposit Capture (RDC) Live Verification Standards */}
-      <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
-        <div className="flex items-center justify-between">
-          <span className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
-            <ShieldCheck className="h-4 w-4 text-emerald-400" />
-            <span>Remote Check Deposit (RDC) Requirements</span>
-          </span>
-          <span className="text-[10px] text-emerald-400 font-mono">Federal Reserve Reg CC Compliant</span>
-        </div>
-        <p className="text-xs text-slate-400">
-          To deposit a check into your trading bot or treasury vault, enter the exact MICR transit routing and account numbers printed along the bottom edge of your paper check, followed by photos of the check front and endorsed back.
-        </p>
-      </div>
-
-      {/* Interactive Personal Check Visualizer (Front & Back) */}
-      <div className="space-y-3">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-bold text-slate-300 flex items-center gap-2">
-            <Eye className="h-4 w-4 text-cyan-400" />
-            <span>Interactive Check Inspection Preview</span>
-          </span>
-          <button
-            type="button"
-            onClick={() => setCheckSide(checkSide === 'FRONT' ? 'BACK' : 'FRONT')}
-            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono text-xs cursor-pointer transition-all"
-          >
-            <RotateCw className="h-3.5 w-3.5 text-cyan-400" />
-            <span>Flip to {checkSide === 'FRONT' ? 'Back (Endorsement)' : 'Front'}</span>
-          </button>
-        </div>
-
-        {checkSide === 'FRONT' ? (
-          /* FRONT OF CHECK */
-          <div className="relative rounded-2xl bg-gradient-to-br from-emerald-950/30 via-slate-900 to-cyan-950/40 border-2 border-emerald-500/40 p-5 sm:p-6 shadow-2xl font-mono text-slate-900 text-xs overflow-hidden">
-            {/* Watermark Security Background pattern */}
-            <div className="absolute inset-0 opacity-5 pointer-events-none bg-[radial-gradient(#10b981_1px,transparent_1px)] [background-size:16px_16px]" />
-
-            <div className="relative z-10 space-y-4">
-              {/* Top Row: Payer Name & Check # */}
-              <div className="flex justify-between items-start text-xs">
-                <div>
-                  <div className="font-bold text-white text-sm tracking-wide">{payerName || 'Payer Name'}</div>
-                  <div className="text-[11px] text-slate-400">100 Wall Street, Suite 400</div>
-                  <div className="text-[11px] text-slate-400">New York, NY 10005</div>
-                </div>
-
-                <div className="text-right">
-                  <div className="font-bold text-white text-lg tracking-widest">#{checkNumber || '1042'}</div>
-                  <div className="text-[11px] text-slate-400 mt-1">
-                    Date: <span className="text-slate-200 underline">{new Date().toLocaleDateString()}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Pay to the Order Line */}
-              <div className="pt-2 flex flex-col sm:flex-row sm:items-end justify-between gap-3 border-b border-slate-700 pb-2">
-                <div className="flex-1 flex items-baseline gap-2">
-                  <span className="text-[10px] text-slate-400 uppercase font-bold shrink-0">PAY TO THE ORDER OF:</span>
-                  <span className="text-white font-bold text-sm underline tracking-wide">
-                    Onset-Traids Trading Desk (Live Custodial Account)
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-base font-bold text-white">Remote Check Deposit (Check 21 RDC)</h3>
+                {checkEnabled === true ? (
+                  <span className="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                    Increase {increaseEnv?.toUpperCase() || 'ACTIVE'}
                   </span>
-                </div>
-
-                <div className="px-3 py-1.5 rounded-lg bg-slate-950 border border-emerald-500/60 font-mono text-base font-black text-emerald-400 shrink-0 text-right">
-                  ${numAmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </div>
-              </div>
-
-              {/* Written Amount in Words */}
-              <div className="border-b border-slate-700 pb-2 text-[11px] text-slate-300 italic">
-                {numAmt > 0 ? (
-                  <span>
-                    *** {numAmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD DOLLARS AND ZERO CENTS ***
+                ) : checkEnabled === false ? (
+                  <span className="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                    Processor Keys Required
                   </span>
                 ) : (
-                  <span>*** ZERO DOLLARS AND 00/100 ***</span>
+                  <span className="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                    Checking Gateway...
+                  </span>
                 )}
               </div>
-
-              {/* Bank Name & Memo & Signature */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end pt-2">
-                <div>
-                  <div className="text-[10px] text-slate-500 uppercase font-semibold">Issuing Financial Institution</div>
-                  <div className="text-white font-bold text-xs truncate">{issuingBank}</div>
-                  <div className="text-[10px] text-emerald-400 font-mono">FDIC Insured Depository</div>
-                </div>
-
-                <div>
-                  <div className="text-[10px] text-slate-500 uppercase font-semibold">Memo Line</div>
-                  <div className="text-slate-300 text-xs underline truncate">{memo || 'Trading Bot Capital'}</div>
-                </div>
-
-                <div className="text-right">
-                  <div className="font-serif italic text-base text-cyan-300 font-semibold border-b border-slate-700 pb-0.5 tracking-wider">
-                    {payerName.slice(0, 18)}
-                  </div>
-                  <div className="text-[9px] text-slate-500 uppercase">Authorized Maker Signature</div>
-                </div>
-              </div>
-
-              {/* MICR Encoding Strip at the Bottom */}
-              <div className="mt-4 pt-3 border-t-2 border-dashed border-slate-700/80 bg-slate-950/80 -mx-6 -mb-6 p-4 rounded-b-2xl flex flex-wrap items-center justify-between text-cyan-400 font-mono tracking-widest text-xs">
-                <div className="flex items-center gap-3">
-                  <span className="text-[10px] text-slate-500 uppercase font-sans">MICR Line:</span>
-                  <span className="text-sm font-bold select-all">
-                    ⑈{checkNumber || '1042'}⑈ ⑆{routingNumber || '021000021'}⑆ •••• {accountNumber.slice(-4) || '8921'}⑈
-                  </span>
-                </div>
-                <div className="text-[10px] text-emerald-400 flex items-center gap-1 font-sans">
-                  <ShieldCheck className="h-3 w-3" />
-                  <span>ABA Routing Checksum: PASSED</span>
-                </div>
-              </div>
+              <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                {checkEnabled === true
+                  ? 'Capture or upload front and endorsed back check photos to submit directly via Increase Check 21 clearing. Funds are held in Pending Clearing until Increase confirms settlement.'
+                  : checkEnabled === false
+                    ? 'Simulated/fake check credits remain disabled (live currency only). Configure Increase credentials in server .env to enable Remote Check Deposit.'
+                    : 'Verifying Increase Check 21 gateway configuration...'}
+              </p>
             </div>
           </div>
-        ) : (
-          /* BACK OF CHECK (ENDORSEMENT AREA) */
-          <div className="rounded-2xl bg-gradient-to-br from-slate-900 to-slate-950 border-2 border-cyan-500/40 p-6 shadow-2xl font-mono text-xs space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div>
-                <span className="font-bold text-white text-sm">Reverse Side Endorsement Area</span>
-                <p className="text-[11px] text-slate-400">Federal Reserve Regulation CC compliant mobile endorsement stamp</p>
-              </div>
-              <span className="px-2.5 py-1 rounded-full bg-cyan-500/20 text-cyan-300 text-[10px] border border-cyan-500/40 font-bold">
-                DIGITALLY VERIFIED
-              </span>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {checkEnabled === false && (
+              <button
+                type="button"
+                onClick={loadConfigAndHistory}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-300 font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Re-check Gateway</span>
+              </button>
+            )}
+            {onSwitchToDeposit && checkEnabled === false && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onSwitchToDeposit('CARD')}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                >
+                  <CreditCard className="h-3.5 w-3.5" />
+                  <span>Card (Stripe)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSwitchToDeposit('BANK')}
+                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white font-bold text-xs flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Landmark className="h-3.5 w-3.5 text-emerald-400" />
+                  <span>Bank (Plaid ACH)</span>
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {checkEnabled === true && increaseEnvNotice && (
+          <div className="p-3 rounded-xl bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200 flex items-start gap-2">
+            <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+            <span>{increaseEnvNotice}</span>
+          </div>
+        )}
+
+        {checkEnabled === false && (
+          <div className="p-3.5 rounded-xl bg-slate-950/90 border border-slate-800 space-y-2 text-xs text-slate-300">
+            <div className="flex items-center gap-2 font-semibold text-amber-300">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span>Required `.env` variables for live check cashing:</span>
             </div>
-
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
-              <div className="border-b-2 border-dashed border-slate-700 pb-2">
-                <div className="text-[10px] text-slate-500 uppercase">ENDORSE HERE</div>
-                <div className="font-serif italic text-lg text-emerald-400 font-semibold tracking-wider pt-1">
-                  ✕ Onset-Traids Trading Desk - Mobile Deposit
-                </div>
-              </div>
-
-              <div className="p-3 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-emerald-200 text-xs font-semibold flex items-center gap-2">
-                <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
-                <span>✓ For Mobile Deposit Only at Onset-Traids Trading (Account #{fiatAccount.accountId})</span>
-              </div>
-
-              <div className="text-[10px] text-slate-500 text-center uppercase tracking-wider pt-2 border-t border-slate-800">
-                DO NOT WRITE, STAMP, OR SIGN BELOW THIS LINE — RESERVED FOR FINANCIAL INSTITUTION
-              </div>
-            </div>
+            <pre className="text-[11px] font-mono bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-cyan-300 overflow-x-auto">
+{`INCREASE_API_KEY=...
+INCREASE_ACCOUNT_ID=...
+INCREASE_ENV=sandbox   # or production`}
+            </pre>
           </div>
         )}
       </div>
 
-      {/* Camera Capture Simulation Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
-          <div className="flex items-center justify-between text-xs">
-            <span className="font-bold text-white flex items-center gap-1.5">
-              <Camera className="h-4 w-4 text-emerald-400" />
-              <span>Check Front Scan</span>
-            </span>
-            <span
-              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                frontCaptured
-                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                  : 'bg-slate-800 text-slate-400'
-              }`}
-            >
-              {frontCaptured ? 'Captured ✓' : 'Awaiting Scan'}
-            </span>
-          </div>
-          <p className="text-[11px] text-slate-400">Position all 4 corners of check front inside camera viewfinder.</p>
-          <div className="pt-1 flex gap-2">
-            <button
-              type="button"
-              onClick={() => setFrontCaptured(true)}
-              className="flex-1 py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 cursor-pointer transition-all"
-            >
-              {frontCaptured ? 'Retake Photo' : 'Capture Front'}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setFrontCaptured(true);
-                setCheckSide('FRONT');
-              }}
-              className="py-1.5 px-3 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-xs font-bold border border-emerald-500/40 cursor-pointer transition-all"
-            >
-              View Front
-            </button>
+      {/* Live Check Balance Strip */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs font-mono">
+        <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800">
+          <div className="text-[10px] uppercase tracking-wider text-slate-400">Available Settled USD</div>
+          <div className="text-lg font-black text-emerald-400 mt-0.5">{formatCurrency(fiatAccount.availableBalance)}</div>
+        </div>
+        <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800">
+          <div className="text-[10px] uppercase tracking-wider text-slate-400">Pending Check Clearing</div>
+          <div className={`text-lg font-black mt-0.5 ${fiatAccount.pendingBalance > 0 ? 'text-amber-300' : 'text-slate-300'}`}>
+            {formatCurrency(fiatAccount.pendingBalance)}
           </div>
         </div>
-
-        <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
-          <div className="flex items-center justify-between text-xs">
-            <span className="font-bold text-white flex items-center gap-1.5">
-              <Camera className="h-4 w-4 text-cyan-400" />
-              <span>Check Back Endorsement Scan</span>
-            </span>
-            <span
-              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                backCaptured
-                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                  : 'bg-slate-800 text-slate-400'
-              }`}
-            >
-              {backCaptured ? 'Captured ✓' : 'Awaiting Scan'}
-            </span>
-          </div>
-          <p className="text-[11px] text-slate-400">Confirm reverse side has signature and mobile deposit endorsement.</p>
-          <div className="pt-1 flex gap-2">
-            <button
-              type="button"
-              onClick={() => setBackCaptured(true)}
-              className="flex-1 py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 cursor-pointer transition-all"
-            >
-              {backCaptured ? 'Retake Photo' : 'Capture Back'}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setBackCaptured(true);
-                setCheckSide('BACK');
-              }}
-              className="py-1.5 px-3 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 text-xs font-bold border border-cyan-500/40 cursor-pointer transition-all"
-            >
-              View Back
-            </button>
-          </div>
+        <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800">
+          <div className="text-[10px] uppercase tracking-wider text-slate-400">Daily Deposit Remaining</div>
+          <div className="text-lg font-black text-cyan-300 mt-0.5">{formatCurrency(dailyRemaining)}</div>
         </div>
       </div>
 
-      {/* Check Details Form */}
-      <form onSubmit={handleCashCheck} className="space-y-4 p-5 rounded-2xl bg-slate-900/90 border border-slate-800 shadow-xl">
-        <h4 className="text-sm font-bold text-white border-b border-slate-800 pb-3 flex items-center gap-2">
-          <Landmark className="h-4 w-4 text-emerald-400" />
-          <span>Verify & Cash Personal Check</span>
-        </h4>
-
-        {/* Row 1: Amount & Check # */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Check Dollar Amount ($ USD) *
-            </label>
-            <div className="relative">
-              <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 text-base font-mono font-bold">$</span>
-              <input
-                type="number"
-                step="0.01"
-                min="1.00"
-                max="25000.00"
-                value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                placeholder="2500.00"
-                className="w-full pl-8 pr-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono text-base font-bold focus:border-emerald-500 focus:outline-none"
-                required
-              />
-            </div>
-            <span className="text-[10px] text-slate-500 font-mono mt-1 block">Daily limit: $25,000.00 USD</span>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Check Number *
-            </label>
-            <input
-              type="text"
-              value={checkNumber}
-              onChange={(e) => setCheckNumber(e.target.value)}
-              placeholder="1042"
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono text-sm focus:border-emerald-500 focus:outline-none"
-              required
-            />
-            <span className="text-[10px] text-slate-500 font-mono mt-1 block">Printed at top-right & MICR strip</span>
-          </div>
-        </div>
-
-        {/* Row 2: Payer Name & Issuing Bank */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Payer / Maker Name *
-            </label>
-            <input
-              type="text"
-              value={payerName}
-              onChange={(e) => setPayerName(e.target.value)}
-              placeholder="e.g. John Doe or Onset-Traids Inc."
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:border-emerald-500 focus:outline-none"
-              required
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Issuing Bank Name
-            </label>
-            <input
-              type="text"
-              value={issuingBank}
-              onChange={(e) => setIssuingBank(e.target.value)}
-              placeholder="e.g. Bank of America, Wells Fargo, etc."
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:border-emerald-500 focus:outline-none"
-            />
-          </div>
-        </div>
-
-        {/* Row 3: Routing Number & Account Number */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              ABA Routing Transit Number (9 Digits) *
-            </label>
-            <input
-              type="text"
-              maxLength={9}
-              value={routingNumber}
-              onChange={(e) => setRoutingNumber(e.target.value)}
-              placeholder="021000021"
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono text-sm focus:border-emerald-500 focus:outline-none"
-              required
-            />
-            <span className="text-[10px] text-emerald-400 font-mono mt-1 block">Federal Reserve checksum validated</span>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Checking Account Number *
-            </label>
-            <input
-              type="text"
-              value={accountNumber}
-              onChange={(e) => setAccountNumber(e.target.value)}
-              placeholder="489218491"
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono text-sm focus:border-emerald-500 focus:outline-none"
-              required
-            />
-            <span className="text-[10px] text-slate-500 font-mono mt-1 block">Tokenized on submission</span>
-          </div>
-        </div>
-
-        {/* Destination Target: Fund Trading Bot vs Live Vault */}
-        <div className="pt-2 border-t border-slate-800 space-y-2">
-          <label className="block text-xs font-bold text-slate-300">
-            Credit Destination Target:
-          </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <button
-              type="button"
-              onClick={() => setDestinationTarget('BOT')}
-              className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex items-start gap-3 ${
-                destinationTarget === 'BOT'
-                  ? 'bg-amber-500/20 border-amber-500 text-white ring-1 ring-amber-500/40 shadow-lg'
-                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
-              }`}
-            >
-              <Zap className="h-5 w-5 text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                  <span>⚡ Fund Trading Bot Directly</span>
-                  <span className="text-[9px] bg-amber-500/30 text-amber-300 px-1.5 py-0.5 rounded font-mono font-bold">RECOMMENDED</span>
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5">
-                  Check funds credit straight to active bot margin. Bot can execute trades immediately.
-                </div>
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setDestinationTarget('VAULT')}
-              className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex items-start gap-3 ${
-                destinationTarget === 'VAULT'
-                  ? 'bg-emerald-500/20 border-emerald-500 text-white ring-1 ring-emerald-500/40 shadow-lg'
-                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
-              }`}
-            >
-              <Landmark className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
-              <div>
-                <div className="text-xs font-bold text-white">
-                  🏛️ Live USD Treasury Vault
-                </div>
-                <div className="text-[11px] text-slate-400 mt-0.5">
-                  Deposit check into FDIC-insured custodial vault balance for holding.
-                </div>
-              </div>
-            </button>
-          </div>
-        </div>
-
-        {/* Settlement Speed: Instant vs Standard */}
-        <div className="pt-2 border-t border-slate-800 space-y-2">
-          <label className="block text-xs font-bold text-slate-300">
-            Clearing Rail & Settlement Speed:
-          </label>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <button
-              type="button"
-              onClick={() => setSettlementSpeed('INSTANT')}
-              className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex items-center justify-between ${
-                settlementSpeed === 'INSTANT'
-                  ? 'bg-emerald-500/20 border-emerald-500 text-white ring-1 ring-emerald-500/40'
-                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
-              }`}
-            >
-              <div>
-                <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                  <Zap className="h-3.5 w-3.5 text-emerald-400" />
-                  <span>Instant Settlement (0 Seconds)</span>
-                </div>
-                <div className="text-[10px] text-slate-400">Ingo Money / RTP Real-Time Rail</div>
-              </div>
-              <span className="text-[11px] font-bold text-emerald-400 font-mono">0% Fee (Free)</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setSettlementSpeed('STANDARD_CLEARING')}
-              className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex items-center justify-between ${
-                settlementSpeed === 'STANDARD_CLEARING'
-                  ? 'bg-emerald-500/20 border-emerald-500 text-white ring-1 ring-emerald-500/40'
-                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
-              }`}
-            >
-              <div>
-                <div className="text-xs font-bold text-white">Standard Clearing (1-2 Days)</div>
-                <div className="text-[10px] text-slate-400">Federal Reserve ACH Clearinghouse</div>
-              </div>
-              <span className="text-[11px] font-bold text-slate-400 font-mono">$0 Fee</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Endorsement Checkbox */}
-        <div className="pt-3 border-t border-slate-800">
-          <label className="flex items-start gap-2.5 text-xs text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={endorsementConfirmed}
-              onChange={(e) => setEndorsementConfirmed(e.target.checked)}
-              className="mt-0.5 rounded text-emerald-500 focus:ring-emerald-500 bg-slate-950 border-slate-700 h-4 w-4"
-              required
-            />
-            <span>
-              I certify that this personal check is properly signed and endorsed on the back with{' '}
-              <strong className="text-emerald-300">"For Mobile Deposit Only at Onset-Traids Trading"</strong> and has not been deposited elsewhere.
-            </span>
-          </label>
-        </div>
-
-        {/* Submit Action */}
-        <div className="pt-3">
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-emerald-500 via-teal-500 to-emerald-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold text-sm tracking-wide shadow-lg shadow-emerald-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-          >
-            {isLoading ? (
-              <>
-                <RefreshCw className="h-4 w-4 animate-spin" />
-                <span>Processing MICR Line & Clearing Check...</span>
-              </>
-            ) : (
-              <>
-                <FileCheck className="h-5 w-5" />
-                <span>Cash Check for +{formatCurrency(numAmt)} Now ({settlementSpeed === 'INSTANT' ? 'Instant 0s' : 'Standard ACH'})</span>
-              </>
-            )}
+      {error && (
+        <div className="p-3.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-center justify-between gap-3">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)} className="text-rose-300 hover:text-white cursor-pointer">
+            <X className="h-4 w-4" />
           </button>
         </div>
+      )}
+
+      {notice && (
+        <div className="p-3.5 rounded-xl bg-emerald-950/60 border border-emerald-500/40 text-xs text-emerald-200 flex items-center justify-between gap-3">
+          <span className="flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+            <span>{notice}</span>
+          </span>
+          <button type="button" onClick={() => setNotice(null)} className="text-emerald-300 hover:text-white cursor-pointer">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Check Deposit Capture Form */}
+      <form onSubmit={handleSubmit} className="p-5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+          <div>
+            <h4 className="text-sm font-bold text-white">Submit Check Images</h4>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Photos are automatically optimized to Check 21 JPEG format before upload.
+            </p>
+          </div>
+          <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+            <ShieldCheck className="h-4 w-4 text-cyan-400" />
+            <span>Check 21 Verified</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1">Check Amount (USD)</label>
+            <div className="relative">
+              <span className="absolute left-3 top-2.5 text-slate-400 font-mono text-sm">$</span>
+              <input
+                type="number"
+                min="1"
+                max="25000"
+                step="0.01"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder="0.00"
+                disabled={!canInteract}
+                className="w-full bg-slate-900 border border-slate-700 text-white pl-8 pr-4 py-2 rounded-xl font-mono text-sm font-bold focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1">Check Number</label>
+            <input
+              type="text"
+              maxLength={32}
+              value={checkNumber}
+              onChange={(e) => setCheckNumber(e.target.value)}
+              placeholder="e.g. 1042"
+              disabled={!canInteract}
+              className="w-full bg-slate-900 border border-slate-700 text-white px-3.5 py-2 rounded-xl font-mono text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1">Payer / Drawer Name</label>
+            <input
+              type="text"
+              maxLength={120}
+              value={payerName}
+              onChange={(e) => setPayerName(e.target.value)}
+              placeholder="Name printed on check"
+              disabled={!canInteract}
+              className="w-full bg-slate-900 border border-slate-700 text-white px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-300 mb-1">Issuing Bank (Optional)</label>
+            <input
+              type="text"
+              maxLength={120}
+              value={issuingBank}
+              onChange={(e) => setIssuingBank(e.target.value)}
+              placeholder="e.g. Chase, Bank of America"
+              disabled={!canInteract}
+              className="w-full bg-slate-900 border border-slate-700 text-white px-3.5 py-2 rounded-xl text-sm focus:outline-none focus:border-cyan-500 disabled:opacity-50"
+            />
+          </div>
+        </div>
+
+        {/* Settlement Destination */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            type="button"
+            disabled={!canInteract}
+            onClick={() => setDestination('TREASURY_VAULT')}
+            className={`p-3 rounded-xl border text-left transition-all cursor-pointer disabled:opacity-50 ${
+              destination === 'TREASURY_VAULT'
+                ? 'bg-cyan-500/15 border-cyan-500/60 text-white'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2 text-xs font-bold">
+              <Landmark className="h-4 w-4 text-cyan-400" />
+              <span>Settle to Live USD Ledger</span>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Available for withdrawals or later bot transfers</div>
+          </button>
+
+          <button
+            type="button"
+            disabled={!canInteract}
+            onClick={() => setDestination('BOT_MARGIN')}
+            className={`p-3 rounded-xl border text-left transition-all cursor-pointer disabled:opacity-50 ${
+              destination === 'BOT_MARGIN'
+                ? 'bg-emerald-500/15 border-emerald-500/60 text-white'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+            }`}
+          >
+            <div className="flex items-center gap-2 text-xs font-bold">
+              <Zap className="h-4 w-4 text-emerald-400" />
+              <span>Settle to Bot Trading Cash</span>
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Credits Bot Active Margin once clearing completes</div>
+          </button>
+        </div>
+
+        {/* Front / Back Image Uploads with Drag & Drop */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                <Camera className="h-3.5 w-3.5 text-cyan-400" />
+                <span>Front of Check</span>
+              </span>
+              {frontImage && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFrontImage('');
+                    setFrontMeta('');
+                  }}
+                  className="text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <label
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (canInteract) setDragSide('front');
+              }}
+              onDragLeave={() => setDragSide(null)}
+              onDrop={(e) => handleDrop('front', e)}
+              className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl p-4 text-center transition-colors min-h-[140px] ${
+                !canInteract
+                  ? 'border-slate-800 opacity-50 cursor-not-allowed'
+                  : dragSide === 'front'
+                    ? 'border-cyan-400 bg-cyan-500/10 cursor-pointer'
+                    : frontImage
+                      ? 'border-emerald-500/50 bg-emerald-950/15 cursor-pointer'
+                      : 'border-slate-700 hover:border-cyan-500/60 cursor-pointer'
+              }`}
+            >
+              {processingSide === 'front' ? (
+                <Loader2 className="h-6 w-6 text-cyan-400 animate-spin mb-1.5" />
+              ) : frontImage ? (
+                <img src={frontImage} alt="Front of check" className="max-h-28 rounded-lg object-contain mb-1.5" />
+              ) : (
+                <Upload className="h-5 w-5 text-slate-400 mb-1.5" />
+              )}
+              <span className="text-[11px] text-slate-300 font-medium break-all">
+                {processingSide === 'front' ? 'Optimizing image...' : frontMeta || 'Click, drop, or take front check photo'}
+              </span>
+              <span className="text-[10px] text-slate-500 mt-0.5">JPEG, PNG, WebP · Auto-sized for Check 21</span>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/*"
+                capture="environment"
+                disabled={!canInteract}
+                onChange={(e) => handleImagePick('front', e)}
+                className="hidden"
+              />
+            </label>
+          </div>
+
+          <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                <Camera className="h-3.5 w-3.5 text-emerald-400" />
+                <span>Back of Check (Endorsed)</span>
+              </span>
+              {backImage && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBackImage('');
+                    setBackMeta('');
+                  }}
+                  className="text-[11px] text-rose-400 hover:text-rose-300 cursor-pointer"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <label
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (canInteract) setDragSide('back');
+              }}
+              onDragLeave={() => setDragSide(null)}
+              onDrop={(e) => handleDrop('back', e)}
+              className={`flex flex-col items-center justify-center border-2 border-dashed rounded-xl p-4 text-center transition-colors min-h-[140px] ${
+                !canInteract
+                  ? 'border-slate-800 opacity-50 cursor-not-allowed'
+                  : dragSide === 'back'
+                    ? 'border-cyan-400 bg-cyan-500/10 cursor-pointer'
+                    : backImage
+                      ? 'border-emerald-500/50 bg-emerald-950/15 cursor-pointer'
+                      : 'border-slate-700 hover:border-cyan-500/60 cursor-pointer'
+              }`}
+            >
+              {processingSide === 'back' ? (
+                <Loader2 className="h-6 w-6 text-cyan-400 animate-spin mb-1.5" />
+              ) : backImage ? (
+                <img src={backImage} alt="Back of check" className="max-h-28 rounded-lg object-contain mb-1.5" />
+              ) : (
+                <Upload className="h-5 w-5 text-slate-400 mb-1.5" />
+              )}
+              <span className="text-[11px] text-slate-300 font-medium break-all">
+                {processingSide === 'back' ? 'Optimizing image...' : backMeta || 'Click, drop, or take endorsed back photo'}
+              </span>
+              <span className="text-[10px] text-slate-500 mt-0.5">Sign + write &quot;For Mobile Deposit Only&quot;</span>
+              <input
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/*"
+                capture="environment"
+                disabled={!canInteract}
+                onChange={(e) => handleImagePick('back', e)}
+                className="hidden"
+              />
+            </label>
+          </div>
+        </div>
+
+        <label className="flex items-start gap-2.5 text-xs text-slate-300 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={endorsementConfirmed}
+            disabled={!canInteract}
+            onChange={(e) => setEndorsementConfirmed(e.target.checked)}
+            className="mt-0.5 rounded border-slate-600 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
+          />
+          <span>
+            I confirm this check is payable to the account holder, endorsed on the back with{' '}
+            <strong>&quot;For Mobile Deposit Only&quot;</strong>, and has not been deposited elsewhere.
+          </span>
+        </label>
+
+        <button
+          type="submit"
+          disabled={!canInteract}
+          className="w-full py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-500 text-slate-950 font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition-all"
+        >
+          {submitting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>Uploading &amp; Submitting to Increase...</span>
+            </>
+          ) : checkEnabled ? (
+            <>
+              <FileCheck className="h-4 w-4" />
+              <span>Submit Check for Live Clearing</span>
+            </>
+          ) : checkEnabled === null ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>Checking Increase Gateway...</span>
+            </>
+          ) : (
+            <span>Configure Increase API Keys in .env to Enable Submission</span>
+          )}
+        </button>
       </form>
+
+      {/* Check Deposit History */}
+      <div className="p-5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-3">
+        <div className="flex items-center justify-between">
+          <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+            <Clock className="h-4 w-4 text-cyan-400" />
+            <span>Submitted Checks ({checks.length})</span>
+          </h4>
+          {checkEnabled && (
+            <button
+              type="button"
+              onClick={handleReconcile}
+              disabled={reconciling}
+              className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-cyan-300 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${reconciling ? 'animate-spin' : ''}`} />
+              <span>{reconciling ? 'Checking...' : 'Refresh Clearing Status'}</span>
+            </button>
+          )}
+        </div>
+
+        {loadingHistory ? (
+          <div className="py-6 text-center text-xs text-slate-500">Loading check history...</div>
+        ) : checks.length === 0 ? (
+          <div className="py-6 text-center text-xs text-slate-500">No checks submitted yet.</div>
+        ) : (
+          <div className="space-y-2">
+            {checks.map((chk) => (
+              <div
+                key={chk.id}
+                className="p-3 rounded-xl bg-slate-900/70 border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs"
+              >
+                <div>
+                  <div className="font-bold text-white flex items-center gap-2">
+                    <span>Check #{chk.checkNumber}</span>
+                    <span className="text-slate-400 font-normal">from {chk.payerName}</span>
+                  </div>
+                  <div className="text-[11px] text-slate-400 font-mono mt-0.5">
+                    {new Date(chk.submittedAt).toLocaleString()} · {chk.destination === 'BOT_MARGIN' ? 'Bot Margin' : 'USD Ledger'}
+                    {chk.issuingBank ? ` · ${chk.issuingBank}` : ''}
+                    {chk.externalId ? ` · Ref: ${chk.externalId}` : ''}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="font-mono font-bold text-white">{formatCurrency(chk.amount)}</span>
+                  <span
+                    className={`text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full border ${
+                      chk.status === 'CLEARED_INSTANT'
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : chk.status === 'REJECTED'
+                          ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    }`}
+                  >
+                    {chk.status === 'CLEARED_INSTANT'
+                      ? 'CLEARED'
+                      : chk.status === 'PENDING_CLEARING'
+                        ? 'PENDING CLEARING'
+                        : chk.status}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

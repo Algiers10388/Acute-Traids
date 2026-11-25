@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import { isBotEmergencyFrozen, getBotMaxSingleOrderUsd } from "./fiatRoutes.ts";
 import crypto from 'crypto';
+import { ethers } from 'ethers';
 import {
   fetchLiveTickers,
   fetchLiveTickerFor,
@@ -10,67 +11,7 @@ import {
   SUPPORTED_ASSETS,
 } from './liveMarketData.ts';
 import { etherscanService } from './etherscanService.ts';
-
-/**
- * Live USD unit price for an asset symbol (BTC, ETH, SOL, ...), from the live ticker feed.
- * Returns null when no live price is available, so callers never fall back to a stale hard-coded number.
- */
-async function getLiveUsdPrice(symbolOrAsset: string): Promise<number | null> {
-  try {
-    const { tickers } = await fetchLiveTickers();
-    const up = symbolOrAsset.toUpperCase();
-    const hit =
-      tickers.find((t) => t.symbol.toUpperCase() === up) ||
-      tickers.find((t) => up.startsWith(t.symbol.toUpperCase()) || t.symbol.toUpperCase().startsWith(up.split(/[-\/_]/)[0]));
-    return hit && Number.isFinite(hit.price) && hit.price > 0 ? hit.price : null;
-  } catch {
-    return null;
-  }
-}
-
-// Runtime credentials store (initialized from process.env, updateable via secure server proxy routes)
-interface WalletCredential {
-  apiKey: string;
-  apiSecret: string;
-  depositAddress?: string;
-  walletLabel?: string;
-  passphrase?: string;
-  linkedAt?: number;
-  isAddressOnly?: boolean;
-  customBalances?: Record<string, string | number>;
-  authError?: string;
-  isVerified?: boolean;
-  verificationSource?: 'EXCHANGE_API' | 'ONCHAIN_RPC' | 'UNLINKED' | 'AUTH_ERROR';
-}
-
-const runtimeCredentials: Record<'KRAKEN' | 'BINANCE' | 'COINBASE' | 'NONKYC' | 'OKX', WalletCredential> = {
-  KRAKEN: {
-    apiKey: process.env.KRAKEN_API_KEY || '',
-    apiSecret: process.env.KRAKEN_API_SECRET || '',
-    depositAddress: '',
-  },
-  BINANCE: {
-    apiKey: process.env.BINANCE_API_KEY || '',
-    apiSecret: process.env.BINANCE_API_SECRET || '',
-    depositAddress: '',
-  },
-  COINBASE: {
-    apiKey: process.env.COINBASE_API_KEY || '',
-    apiSecret: process.env.COINBASE_API_SECRET || '',
-    depositAddress: '',
-  },
-  NONKYC: {
-    apiKey: process.env.NONKYC_API_KEY || '',
-    apiSecret: process.env.NONKYC_API_SECRET || '',
-    depositAddress: '',
-  },
-  OKX: {
-    apiKey: process.env.OKX_API_KEY || '',
-    apiSecret: process.env.OKX_API_SECRET || '',
-    passphrase: process.env.OKX_PASSPHRASE || '',
-    depositAddress: '',
-  },
-};
+import { getExchangeCredentials, runtimeCredentials, getLiveUsdPrice, type SpotExchangeId } from './liveSpotExecutor.ts';
 
 interface WalletTxRecord {
   id: string;
@@ -88,6 +29,295 @@ interface WalletTxRecord {
 }
 
 let walletTransactions: WalletTxRecord[] = [];
+
+const SUPPORTED_DEPOSIT_EXCHANGES: SpotExchangeId[] = ['KRAKEN', 'BINANCE', 'COINBASE', 'OKX', 'NONKYC'];
+
+export function recordVaultExchangeTransfer(entry: Omit<WalletTxRecord, 'id' | 'timestamp'>): WalletTxRecord {
+  const record: WalletTxRecord = {
+    id: `vtx-${entry.exchange.toLowerCase()}-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex')}`,
+    timestamp: Date.now(),
+    ...entry,
+  };
+  const existingIdx = walletTransactions.findIndex((t) => t.txHash.toLowerCase() === record.txHash.toLowerCase());
+  if (existingIdx >= 0) {
+    walletTransactions[existingIdx] = record;
+  } else {
+    walletTransactions.unshift(record);
+    if (walletTransactions.length > 100) {
+      walletTransactions = walletTransactions.slice(0, 100);
+    }
+  }
+  return record;
+}
+
+function normalizeEvmAddress(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(s)) return null;
+  try {
+    const addr = ethers.getAddress(s);
+    return addr === ethers.ZeroAddress ? null : addr;
+  } catch {
+    return null;
+  }
+}
+
+function krakenChainRegex(chain: string): RegExp {
+  const c = chain.toLowerCase();
+  if (c === 'arbitrum') return /arbitrum/i;
+  if (c === 'base') return /base/i;
+  if (c === 'optimism') return /optimism/i;
+  if (c === 'polygon') return /polygon|matic/i;
+  return /ether|erc20|mainnet|ethereum/i;
+}
+
+function binanceNetworkCode(chain: string): string {
+  const c = chain.toLowerCase();
+  if (c === 'arbitrum') return 'ARBITRUM';
+  if (c === 'base') return 'BASE';
+  if (c === 'optimism') return 'OPTIMISM';
+  if (c === 'polygon') return 'MATIC';
+  if (c === 'bsc') return 'BSC';
+  if (c === 'avalanche') return 'AVAXC';
+  return 'ETH';
+}
+
+function okxChainMatcher(chain: string): RegExp {
+  const c = chain.toLowerCase();
+  if (c === 'arbitrum') return /arbitrum/i;
+  if (c === 'base') return /base/i;
+  if (c === 'optimism') return /optimism/i;
+  if (c === 'polygon') return /polygon|matic/i;
+  if (c === 'bsc') return /bsc|bep20/i;
+  if (c === 'avalanche') return /avax/i;
+  return /erc20|ethereum/i;
+}
+
+export async function lookupExchangeDepositAddress(params: {
+  exchange: string;
+  asset?: string;
+  chain?: string;
+  createNew?: boolean;
+}): Promise<{
+  ok: boolean;
+  status: number;
+  exchange: SpotExchangeId;
+  chain: string;
+  asset: string;
+  depositAddress?: string;
+  source?: 'EXCHANGE_API' | 'LINKED_WALLET_ADDRESS';
+  method?: string;
+  addresses?: Array<{ address: string; method?: string; new?: boolean }>;
+  requiresAddressOrKeys?: boolean;
+  error?: string;
+  hint?: string;
+}> {
+  const ex = String(params.exchange || 'KRAKEN').trim().toUpperCase() as SpotExchangeId;
+  const asset = String(params.asset || 'ETH').trim().toUpperCase().split('/')[0] || 'ETH';
+  const chain = String(params.chain || 'arbitrum').trim().toLowerCase() || 'arbitrum';
+
+  if (!SUPPORTED_DEPOSIT_EXCHANGES.includes(ex)) {
+    return {
+      ok: false,
+      status: 400,
+      exchange: ex,
+      chain,
+      asset,
+      error: `Unsupported exchange '${params.exchange}'. Choose one of: ${SUPPORTED_DEPOSIT_EXCHANGES.join(', ')}.`,
+    };
+  }
+
+  const linkedAddr = normalizeEvmAddress(runtimeCredentials[ex]?.depositAddress);
+  const { apiKey, apiSecret, passphrase } = getExchangeCredentials(ex);
+  let apiError: string | undefined;
+
+  if (apiKey && apiSecret) {
+    try {
+      if (ex === 'KRAKEN') {
+        const krakenAsset = asset === 'ETH' || asset === 'WETH' ? 'ETH' : asset === 'BTC' || asset === 'WBTC' ? 'XBT' : asset;
+        const signKraken = (apiPath: string, bodyParams: Record<string, string>) => {
+          const nonce = String(Date.now()) + '000';
+          const postData = new URLSearchParams({ nonce, ...bodyParams }).toString();
+          const hash = crypto.createHash('sha256').update(nonce + postData).digest();
+          const hmac = crypto
+            .createHmac('sha512', Buffer.from(apiSecret, 'base64'))
+            .update(Buffer.concat([Buffer.from(apiPath), hash]))
+            .digest('base64');
+          return { postData, hmac };
+        };
+
+        const mReq = signKraken('/0/private/DepositMethods', { asset: krakenAsset });
+        const mRes = await fetch('https://api.kraken.com/0/private/DepositMethods', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'API-Key': apiKey, 'API-Sign': mReq.hmac },
+          body: mReq.postData,
+          signal: AbortSignal.timeout(10_000),
+        });
+        const mJson: any = await mRes.json().catch(() => ({}));
+        if (mJson?.error?.length) {
+          throw new Error(mJson.error.join(', '));
+        }
+        const methods: Array<{ method: string }> = Array.isArray(mJson?.result) ? mJson.result : [];
+        const matcher = krakenChainRegex(chain);
+        const chosenMethod = (methods.find((m) => matcher.test(m.method)) || methods[0])?.method;
+        if (!chosenMethod) {
+          throw new Error(`Kraken returned no ${asset} deposit methods matching ${chain}.`);
+        }
+
+        const aReq = signKraken('/0/private/DepositAddresses', {
+          asset: krakenAsset,
+          method: chosenMethod,
+          ...(params.createNew ? { new: 'true' } : {}),
+        });
+        const aRes = await fetch('https://api.kraken.com/0/private/DepositAddresses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'API-Key': apiKey, 'API-Sign': aReq.hmac },
+          body: aReq.postData,
+          signal: AbortSignal.timeout(10_000),
+        });
+        const aJson: any = await aRes.json().catch(() => ({}));
+        if (aJson?.error?.length) {
+          throw new Error(aJson.error.join(', '));
+        }
+        const rawList = Array.isArray(aJson?.result) ? aJson.result : [];
+        const evmAddresses = rawList
+          .map((item: any) => ({ address: normalizeEvmAddress(item?.address), method: chosenMethod, new: Boolean(item?.new) }))
+          .filter((x: any): x is { address: string; method: string; new: boolean } => Boolean(x.address));
+
+        if (evmAddresses.length > 0) {
+          return {
+            ok: true,
+            status: 200,
+            exchange: ex,
+            chain,
+            asset,
+            source: 'EXCHANGE_API',
+            depositAddress: evmAddresses[0].address,
+            method: chosenMethod,
+            addresses: evmAddresses,
+          };
+        }
+        apiError = `Kraken has no generated ${chosenMethod} address for ${asset} yet. Generate or copy it from Kraken Deposit UI or re-fetch with createNew=true.`;
+      } else if (ex === 'BINANCE') {
+        const network = binanceNetworkCode(chain);
+        const coin = asset === 'WETH' ? 'ETH' : asset;
+        const ts = Date.now();
+        const qs = `coin=${encodeURIComponent(coin)}&network=${encodeURIComponent(network)}&timestamp=${ts}`;
+        const sig = crypto.createHmac('sha256', apiSecret).update(qs).digest('hex');
+        const bRes = await fetch(`https://api.binance.com/sapi/v1/capital/deposit/address?${qs}&signature=${sig}`, {
+          headers: { 'X-MBX-APIKEY': apiKey },
+          signal: AbortSignal.timeout(10_000),
+        });
+        const bJson: any = await bRes.json().catch(() => ({}));
+        const addr = normalizeEvmAddress(bJson?.address);
+        if (bRes.ok && addr) {
+          return {
+            ok: true,
+            status: 200,
+            exchange: ex,
+            chain,
+            asset: coin,
+            source: 'EXCHANGE_API',
+            depositAddress: addr,
+            method: network,
+            addresses: [{ address: addr, method: network }],
+          };
+        }
+        apiError = bJson?.msg || `Binance deposit address query returned HTTP ${bRes.status}.`;
+      } else if (ex === 'OKX' && passphrase) {
+        const ts = new Date().toISOString();
+        const reqPath = `/api/v5/asset/deposit-address?ccy=${encodeURIComponent(asset === 'WETH' ? 'ETH' : asset)}`;
+        const sign = crypto.createHmac('sha256', apiSecret).update(`${ts}GET${reqPath}`).digest('base64');
+        const oRes = await fetch(`https://www.okx.com${reqPath}`, {
+          headers: {
+            'OK-ACCESS-KEY': apiKey,
+            'OK-ACCESS-SIGN': sign,
+            'OK-ACCESS-TIMESTAMP': ts,
+            'OK-ACCESS-PASSPHRASE': passphrase,
+          },
+          signal: AbortSignal.timeout(10_000),
+        });
+        const oJson: any = await oRes.json().catch(() => ({}));
+        const rows = Array.isArray(oJson?.data) ? oJson.data : [];
+        const matcher = okxChainMatcher(chain);
+        const matched = rows.find((r: any) => matcher.test(String(r?.chain || '')) && normalizeEvmAddress(r?.addr))
+          || rows.find((r: any) => normalizeEvmAddress(r?.addr));
+        const addr = normalizeEvmAddress(matched?.addr);
+        if (oRes.ok && oJson?.code === '0' && addr) {
+          return {
+            ok: true,
+            status: 200,
+            exchange: ex,
+            chain,
+            asset,
+            source: 'EXCHANGE_API',
+            depositAddress: addr,
+            method: matched?.chain,
+            addresses: [{ address: addr, method: matched?.chain }],
+          };
+        }
+        apiError = oJson?.msg || `OKX returned no EVM deposit address for ${asset} on ${chain}.`;
+      } else if (ex === 'NONKYC') {
+        const ticker = asset === 'WETH' ? 'ETH' : asset;
+        const url = `https://api.nonkyc.io/api/v2/getdepositaddress/${encodeURIComponent(ticker)}`;
+        const nonce = Date.now();
+        const sign = crypto.createHmac('sha256', apiSecret).update(`${apiKey}${url}${nonce}`).digest('hex');
+        const nRes = await fetch(url, {
+          headers: {
+            'X-API-KEY': apiKey,
+            'X-API-NONCE': String(nonce),
+            'X-API-SIGN': sign,
+          },
+          signal: AbortSignal.timeout(10_000),
+        });
+        const nJson: any = await nRes.json().catch(() => ({}));
+        const addr = normalizeEvmAddress(nJson?.address);
+        if (nRes.ok && addr) {
+          return {
+            ok: true,
+            status: 200,
+            exchange: ex,
+            chain,
+            asset: ticker,
+            source: 'EXCHANGE_API',
+            depositAddress: addr,
+            method: nJson?.network || chain,
+            addresses: [{ address: addr, method: nJson?.network || chain }],
+          };
+        }
+        apiError = nJson?.error || `NonKYC returned no EVM deposit address for ${ticker}.`;
+      } else if (ex === 'COINBASE') {
+        apiError = 'Coinbase Advanced API does not expose multi-chain deposit addresses without Coinbase v2 wallet permissions. Paste or link your Coinbase EVM deposit address below.';
+      }
+    } catch (err: any) {
+      apiError = err?.message || `Failed to query live ${ex} deposit address.`;
+    }
+  }
+
+  if (linkedAddr) {
+    return {
+      ok: true,
+      status: 200,
+      exchange: ex,
+      chain,
+      asset,
+      source: 'LINKED_WALLET_ADDRESS',
+      depositAddress: linkedAddr,
+      addresses: [{ address: linkedAddr, method: 'Linked Deposit Address' }],
+      hint: apiError ? `Used your linked ${ex} deposit address (${apiError})` : undefined,
+    };
+  }
+
+  return {
+    ok: false,
+    status: 400,
+    exchange: ex,
+    chain,
+    asset,
+    requiresAddressOrKeys: true,
+    error: apiError || `No live ${ex} EVM deposit address configured yet. Paste your ${ex} ${chain.toUpperCase()} ${asset} deposit address or link ${ex} API keys with Funding/Deposit Query permission.`,
+  };
+}
 
 // Server-side kill switch: real orders are refused unless the operator opts in with ENABLE_LIVE_TRADING=1,
 // whatever the browser UI thinks its mode is.
@@ -1916,6 +2146,33 @@ async function getEthOnchainBalance(address: string): Promise<number | null> {
       count: walletTransactions.length,
       timestamp: Date.now(),
     });
+  });
+
+  // 9b. Fetch Live Deposit Address for Kraken / Exchange (or linked deposit address fallback)
+  app.get('/api/exchange/deposit-address', async (req: Request, res: Response) => {
+    try {
+      const result = await lookupExchangeDepositAddress({
+        exchange: String(req.query.exchange || 'KRAKEN'),
+        asset: typeof req.query.asset === 'string' ? req.query.asset : 'ETH',
+        chain: typeof req.query.chain === 'string' ? req.query.chain : 'arbitrum',
+        createNew: req.query.createNew === '1' || req.query.createNew === 'true',
+      });
+      return res.status(result.status).json({
+        success: result.ok,
+        exchange: result.exchange,
+        chain: result.chain,
+        asset: result.asset,
+        depositAddress: result.depositAddress || null,
+        source: result.source || null,
+        method: result.method || null,
+        addresses: result.addresses || [],
+        requiresAddressOrKeys: Boolean(result.requiresAddressOrKeys),
+        hint: result.hint,
+        error: result.error,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: err?.message || 'Failed to look up exchange deposit address.' });
+    }
   });
 
   // 10. Live Real Order Execution Handler (Smart Order Routing & Direct Routing)

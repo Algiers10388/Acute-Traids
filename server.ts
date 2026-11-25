@@ -63,13 +63,20 @@ function getGenAI(): GoogleGenAI | null {
 async function startServer() {
   const app = express();
   // Keep the raw body: the Stripe webhook signature is computed over the exact bytes.
-  app.use(express.json({ verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
+  // Allow up to 25 MB so front/back Check 21 base64 images upload cleanly.
+  app.use(express.json({ limit: "25mb", verify: (req: any, _res, buf) => { req.rawBody = buf; } }));
 
   // ---- Access guard for the whole /api surface (see server/accessGuard.ts and its tests) ----
   app.use("/api", createAccessGuard({ token: process.env.API_ACCESS_TOKEN || "" }));
 
-  // Prevent Express from returning HTML on invalid JSON bodies
+  // Prevent Express from returning HTML on invalid or oversized JSON bodies
   app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err?.type === 'entity.too.large' || err?.status === 413) {
+      return res.status(413).json({
+        success: false,
+        error: 'Upload payload is too large (max 25 MB). Please use smaller or compressed check images.',
+      });
+    }
     if (err instanceof SyntaxError && 'body' in err) {
       return res.status(400).json({ success: false, error: 'Malformed JSON payload in request' });
     }

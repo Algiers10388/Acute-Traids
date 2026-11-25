@@ -1,31 +1,6 @@
-import {
-  FiatAccount,
-  FiatTransaction,
-  LinkedBankAccount,
-  LinkedDebitCard,
-  ThreeDSChallengeSession,
-  ThreeDSVerificationResult,
-} from '../types';
+import { FiatAccount, FiatTransaction, BotSecuritySettings } from '../types';
 
-export interface CardInput {
-  cardNumber: string;
-  expMonth: number;
-  expYear: number;
-  cvc: string;
-  cardholderName: string;
-  saveCard?: boolean;
-}
-
-export interface BankInput {
-  bankName: string;
-  routingNumber: string;
-  accountNumber: string;
-  accountType: 'CHECKING' | 'SAVINGS' | 'BUSINESS';
-  accountHolderName: string;
-  connectedVia?: 'PLAID_OPEN_BANKING' | 'MANUAL_ACH_ROUTING';
-}
-
-// Resilient JSON response parser preventing "Unexpected token '<', not valid JSON" errors
+// Resilient JSON response parser preventing HTML gateway responses from breaking UI state
 async function safeParseJson<T = any>(res: Response, fallbackError = 'Request failed'): Promise<T> {
   let text = '';
   try {
@@ -54,7 +29,15 @@ async function safeParseJson<T = any>(res: Response, fallbackError = 'Request fa
 
   if (!res.ok || (data && data.success === false)) {
     const errorMsg = (data && data.error) || (data && data.message) || `${fallbackError} (HTTP ${res.status})`;
-    throw new Error(errorMsg);
+    const err: any = new Error(errorMsg);
+    if (data && typeof data === 'object') {
+      err.requires2FA = Boolean(data.requires2FA);
+      err.twoFactorSetupRequired = Boolean(data.twoFactorSetupRequired);
+      err.code = data.code;
+      err.paypal = data.paypal;
+    }
+    err.status = res.status;
+    throw err;
   }
 
   return (data || {}) as T;
@@ -73,31 +56,12 @@ export function fiatFetch(url: string, init?: RequestInit): Promise<Response> {
 
 export async function fetchFiatAccount(): Promise<{
   account: FiatAccount;
+  botSecurity?: BotSecuritySettings;
   security: any;
 }> {
   const res = await fiatFetch('/api/fiat/account');
   const data = await safeParseJson(res, 'Failed to retrieve live currency account');
-  return { account: data.account, security: data.security };
-}
-
-export async function depositViaCard(
-  amount: number,
-  cardId?: string,
-  newCard?: CardInput,
-  directToBot: boolean = false
-): Promise<{
-  account: FiatAccount;
-  transaction: FiatTransaction;
-  message: string;
-  directToBot?: boolean;
-  botCreditAmount?: number;
-}> {
-  const res = await fiatFetch('/api/fiat/deposit/card', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ amount, cardId, newCard, directToBot }),
-  });
-  return safeParseJson(res, 'Debit card load failed');
+  return { account: data.account, botSecurity: data.botSecurity, security: data.security };
 }
 
 export async function syncBotCapital(
@@ -116,130 +80,33 @@ export async function syncBotCapital(
   }
 }
 
-export async function linkDebitCard(
-  cardData: CardInput
-): Promise<{ account: FiatAccount; card: LinkedDebitCard; message: string }> {
-  const res = await fiatFetch('/api/fiat/link-card', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(cardData),
-  });
-  return safeParseJson(res, 'Failed to link debit card');
-}
-
 export async function removeBankAccount(
   bankId: string
 ): Promise<{ success: boolean; account: FiatAccount; message: string }> {
-  const res = await fiatFetch(`/api/fiat/bank/${bankId}`, {
+  const res = await fiatFetch(`/api/fiat/bank/${encodeURIComponent(bankId)}`, {
     method: 'DELETE',
   });
   return safeParseJson(res, 'Failed to remove bank account');
 }
 
-export async function removeDebitCard(
-  cardId: string
-): Promise<{ success: boolean; account: FiatAccount; message: string }> {
-  const res = await fiatFetch(`/api/fiat/card/${cardId}`, {
-    method: 'DELETE',
-  });
-  return safeParseJson(res, 'Failed to remove card');
-}
-
 export async function transferBetweenFiatAndBot(
   direction: 'TO_BOT' | 'FROM_BOT',
-  amount: number
+  amount: number,
+  twoFactorCode?: string
 ): Promise<{ account: FiatAccount; transaction: FiatTransaction; message: string }> {
   const res = await fiatFetch('/api/fiat/transfer-bot', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ direction, amount }),
+    body: JSON.stringify({ direction, amount, ...(twoFactorCode ? { twoFactorCode } : {}) }),
   });
   return safeParseJson(res, 'Transfer failed');
-}
-
-export interface WithdrawalRequest {
-  destinationType: 'BANK' | 'CARD';
-  bankId?: string;
-  cardId?: string;
-  amount: number;
-  rail?: 'ACH_TRANSFER' | 'INSTANT_FEDNOW' | 'SAME_DAY_WIRE' | 'VISA_DIRECT_PUSH';
-  source?: 'TREASURY' | 'BOT';
-  newDestination?: any;
-  twoFactorCode?: string;
-}
-
-export async function withdrawFunds(
-  req: WithdrawalRequest
-): Promise<{ account: FiatAccount; transaction: FiatTransaction; message: string; botAmountDeducted?: number }> {
-  const res = await fiatFetch('/api/fiat/withdraw', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(req),
-  });
-  return safeParseJson(res, 'Withdrawal processing failed');
-}
-
-export async function withdrawToBank(
-  bankId: string,
-  amount: number
-): Promise<{ account: FiatAccount; transaction: FiatTransaction; message: string }> {
-  return withdrawFunds({
-    destinationType: 'BANK',
-    bankId,
-    amount,
-    rail: 'ACH_TRANSFER',
-  });
 }
 
 export async function fetchFiatTransactions(): Promise<FiatTransaction[]> {
   const res = await fiatFetch('/api/fiat/transactions');
   if (!res.ok) return [];
-  const data = await res.json();
+  const data = await safeParseJson(res, 'Failed to fetch transactions').catch(() => ({ transactions: [] }));
   return data.transactions || [];
-}
-
-export interface CheckDepositInput {
-  amount: number;
-  payerName: string;
-  checkNumber: string;
-  routingNumber: string;
-  accountNumber: string;
-  issuingBank?: string;
-  settlementSpeed?: 'INSTANT' | 'STANDARD_CLEARING';
-  directToBot?: boolean;
-  endorsementConfirmed: boolean;
-  frontImageUrl?: string;
-  backImageUrl?: string;
-  memo?: string;
-  twoFactorCode?: string;
-}
-
-export async function depositPersonalCheck(
-  input: CheckDepositInput
-): Promise<{
-  account: FiatAccount;
-  transaction: FiatTransaction;
-  check: any;
-  message: string;
-  directToBot?: boolean;
-  botCreditAmount?: number;
-}> {
-  const res = await fiatFetch('/api/fiat/deposit/check', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input),
-  });
-  return safeParseJson(res, 'Failed to cash personal check');
-}
-
-export async function fetchCheckDeposits(): Promise<any[]> {
-  try {
-    const res = await fiatFetch('/api/fiat/check-deposits');
-    const data = await safeParseJson(res, 'Failed to fetch check deposits');
-    return data.checks || [];
-  } catch {
-    return [];
-  }
 }
 
 export async function fetchSecurityAudit(): Promise<any | null> {
@@ -254,7 +121,7 @@ export async function fetchSecurityAudit(): Promise<any | null> {
 
 export async function updateBotProtection(
   settings: any
-): Promise<{ success: boolean; message: string; botSecurity: any; account: FiatAccount }> {
+): Promise<{ success: boolean; message: string; botSecurity: BotSecuritySettings; account: FiatAccount }> {
   const res = await fiatFetch('/api/fiat/security/update-bot-protection', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -263,44 +130,193 @@ export async function updateBotProtection(
   return safeParseJson(res, 'Failed to update bot protection');
 }
 
-export async function initiate3DsChallenge(payload: {
-  amount: number;
-  depositType?: 'CARD' | 'BANK';
-  cardId?: string;
-  newCard?: CardInput;
-  bankId?: string;
-  newBank?: any;
-  transferSpeed?: string;
-  directToBot?: boolean;
-}): Promise<{
+export async function setupTotp2FA(twoFactorCode?: string): Promise<{
   success: boolean;
-  session: ThreeDSChallengeSession;
-  suggestedOtp?: string;
+  secret: string;
+  otpauthUri: string;
+  issuer: string;
+  accountLabel: string;
   message: string;
 }> {
-  const res = await fetch('/api/fiat/3ds/initiate', {
+  const res = await fiatFetch('/api/fiat/security/totp/setup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(twoFactorCode ? { twoFactorCode } : {}),
   });
-  return safeParseJson(res, 'Failed to initiate 3D Secure challenge');
+  return safeParseJson(res, 'Failed to start 2FA setup');
 }
 
-export async function verify3DsChallenge(payload: {
-  sessionId: string;
-  authCode?: string;
-  biometricConfirmed?: boolean;
+export async function confirmTotp2FA(code: string): Promise<{
+  success: boolean;
+  twoFactorConfigured: boolean;
+  account: FiatAccount;
+  botSecurity: BotSecuritySettings;
+  message: string;
+}> {
+  const res = await fiatFetch('/api/fiat/security/totp/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  return safeParseJson(res, 'Failed to verify 2FA code');
+}
+
+export async function fetchCheckDeposits(): Promise<any[]> {
+  const res = await fiatFetch('/api/fiat/check-deposits');
+  if (!res.ok) return [];
+  const data = await safeParseJson(res, 'Failed to load check deposits').catch(() => ({ checks: [] }));
+  return data.checks || [];
+}
+
+export async function submitCheckDeposit(payload: {
+  amount: number;
+  checkNumber: string;
+  payerName: string;
+  issuingBank?: string;
+  routingNumber?: string;
+  accountNumber?: string;
+  endorsementConfirmed: boolean;
+  destination: 'BOT_MARGIN' | 'TREASURY_VAULT';
+  frontImage: string;
+  backImage: string;
+  idempotencyKey: string;
 }): Promise<{
   success: boolean;
-  result: ThreeDSVerificationResult;
+  processing?: boolean;
+  check: any;
   transaction: FiatTransaction;
   account: FiatAccount;
   message: string;
 }> {
-  const res = await fetch('/api/fiat/3ds/verify', {
+  const res = await fiatFetch('/api/fiat/deposit/check', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  return safeParseJson(res, 'Failed to verify 3D Secure authentication');
+  return safeParseJson(res, 'Check deposit submission failed');
 }
+
+export async function reconcileCheckDeposits(): Promise<{
+  success: boolean;
+  checks: any[];
+  account: FiatAccount;
+  transactions: FiatTransaction[];
+}> {
+  const res = await fiatFetch('/api/fiat/check-deposits/reconcile', {
+    method: 'POST',
+  });
+  return safeParseJson(res, 'Failed to refresh check clearing status');
+}
+
+export interface CryptoToCashQuote {
+  exchange: 'KRAKEN' | 'COINBASE' | 'BINANCE' | 'NONKYC' | 'OKX';
+  symbol: string;
+  baseAsset: string;
+  quantity: number;
+  unitPriceUsd: number;
+  grossUsd: number;
+  feeRate: number;
+  estimatedFeeUsd: number;
+  netUsd: number;
+  exchangeConfigured: boolean;
+  liveTradingEnabled: boolean;
+  paypalReady: boolean;
+  withinSingleOrderCap: boolean;
+  withinDailyWithdrawalLimit: boolean;
+  dailyLimitUsd: number;
+  remainingDailyUsd: number;
+  meetsPaypalMinimum: boolean;
+}
+
+export async function quoteCryptoToCash(payload: {
+  exchange: string;
+  symbol: string;
+  quantity: number;
+}): Promise<{ success: boolean; quote: CryptoToCashQuote }> {
+  const res = await fiatFetch('/api/fiat/crypto-to-cash/quote', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return safeParseJson(res, 'Failed to quote crypto position');
+}
+
+export async function executeCryptoToCash(payload: {
+  exchange: string;
+  symbol: string;
+  quantity: number;
+  positionId?: string;
+  recipientId: number;
+  twoFactorCode: string;
+  idempotencyKey: string;
+}): Promise<{
+  success: boolean;
+  processing?: boolean;
+  duplicate?: boolean;
+  unknownOutcome?: boolean;
+  sellCompleted?: boolean;
+  sellResult?: {
+    exchangeOrderId: string;
+    exchange: string;
+    symbol: string;
+    quantity: number;
+    unitPriceUsd: number;
+    grossUsd: number;
+    exchangeFeeUsd: number;
+    netProceedsUsd: number;
+    cryptographicReceipt: string;
+    note: string;
+  };
+  liquidationTransaction?: FiatTransaction | null;
+  payoutTransaction?: FiatTransaction | null;
+  account: FiatAccount;
+  message: string;
+}> {
+  const res = await fiatFetch('/api/fiat/crypto-to-cash', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return safeParseJson(res, 'Crypto-to-Cash payout failed');
+}
+
+export async function reconcilePaypalPayouts(): Promise<{
+  success: boolean;
+  account: FiatAccount;
+  transactions: FiatTransaction[];
+}> {
+  const res = await fiatFetch('/api/fiat/withdraw/paypal/reconcile', {
+    method: 'POST',
+  });
+  return safeParseJson(res, 'Failed to refresh PayPal payout status');
+}
+
+export async function verifyPaypalAuth(forceRefresh = true): Promise<{
+  success: boolean;
+  configured: boolean;
+  env: 'sandbox' | 'live';
+  oauthOk: boolean;
+  payoutScopePresent: boolean;
+  readProbeOk: boolean;
+  authorizationWarning: string | null;
+  lastAuthorizationIssue: {
+    status: number;
+    name: string;
+    debugId?: string;
+    env: 'sandbox' | 'live';
+    oauthPayoutScope: boolean;
+    message: string;
+    actionRequired: string;
+    timestamp: number;
+  } | null;
+  message: string;
+}> {
+  const res = await fiatFetch('/api/fiat/paypal/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ forceRefresh }),
+  });
+  return safeParseJson(res, 'PayPal authorization verification failed');
+}
+
+

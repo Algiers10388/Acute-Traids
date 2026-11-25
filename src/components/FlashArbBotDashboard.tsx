@@ -61,7 +61,7 @@ import {
   ArbTokenConfig,
   FlashLoanProviderId,
   GasOptimizationLevel,
-} from '../data/flashArbConfig';
+} from '../config/flashArbConfig';
 import { CryptoAsset } from '../types';
 import { useAuth } from '../context/AuthContext';
 import {
@@ -79,6 +79,7 @@ interface FlashArbBotDashboardProps {
   onOpenAiTroubleshooter?: (prompt?: string) => void;
   availableAssets?: CryptoAsset[];
   onOpenCakeWallet?: () => void;
+  onOpenVaultTransfer?: () => void;
   onArbitrageExecuted?: (trade: {
     symbol: string;
     profitUsd: number;
@@ -172,6 +173,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   onOpenAiTroubleshooter,
   availableAssets = [],
   onOpenCakeWallet,
+  onOpenVaultTransfer,
   onArbitrageExecuted,
 }) => {
   const { firebaseUser } = useAuth();
@@ -239,9 +241,10 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
   } | null>(null);
 
   // Treasury & Execution Architecture Configuration
-  const defaultProfitWallet = '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b';
-  const defaultProfitWalletLabel = 'Primary Profit Vault (..f5b)';
-  const legacyDefaultProfitWallet = '0x65602eb9e09b07002872e074004400d37e27ccb9';
+  const defaultProfitWallet = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+  const defaultProfitWalletLabel = 'Primary Profit Vault (..6Cc2)';
+  const legacyDefaultProfitWallet = '0xd5503c876a5dfee057727cfacb6a59e8c7554f5b';
+  const olderDefaultProfitWallet = '0x65602eb9e09b07002872e074004400d37e27ccb9';
   const defaultGasWallet = '0xF1d765d693f9e6fAb0c4a2FCa942d9D54233C966';
 
   const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -1510,7 +1513,7 @@ export const FlashArbBotDashboard: React.FC<FlashArbBotDashboardProps> = ({
     try {
       const extraTokenAddresses = parseExtraTokenAddresses(rt.extraTokensInput);
       const overviewContracts =
-        holdingsOverview?.chain === targetChain && Array.isArray(holdingsOverview.contracts)
+        holdingsOverview?.chain === targetChain && Array.isArray(holdingsOverview?.contracts)
           ? holdingsOverview.contracts.map((c) => c.address)
           : [];
       const candidateContracts = [
@@ -5640,6 +5643,18 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       )}
                     </div>
 
+                    {onOpenVaultTransfer && (
+                      <button
+                        type="button"
+                        onClick={onOpenVaultTransfer}
+                        className="px-3 py-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-400/50 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+                        title="Transfer realized profits from your Vault directly to Kraken or another exchange"
+                      >
+                        <ArrowUpRight className="h-3.5 w-3.5 text-cyan-300" />
+                        <span>Vault → Kraken / CEX</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onClick={() => setIsEditingWallet(true)}
@@ -5666,7 +5681,7 @@ RPC_BASE_WS=wss://base-mainnet.public.blastapi.io
                       setProfitWalletInput(e.target.value);
                       if (walletValidationError) setWalletValidationError(null);
                     }}
-                    placeholder="0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b"
+                    placeholder="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
                     className="w-full bg-slate-900 border border-slate-700 focus:border-emerald-400 rounded-xl px-3 py-2 text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none"
                   />
                 </div>

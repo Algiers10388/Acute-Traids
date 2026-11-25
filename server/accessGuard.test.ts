@@ -54,3 +54,10 @@ test('query string does not change the decision', () => {
   assert.equal(run(g, { url: '/api/exchange/execute-order?x=/api/health', ip: '203.0.113.9' }).passed, false);
   assert.equal(run(g, { url: '/api/health?x=1', ip: '203.0.113.9' }).passed, true);
 });
+test('behind a proxy, same-origin Origin matching X-Forwarded-Host passes when sec-fetch-site is omitted; mismatched/cross-site Origin fails', () => {
+  const g = createAccessGuard({ env: { K_SERVICE: 'run' } });
+  assert.equal(run(g, { headers: { origin: 'https://app.example.com', 'x-forwarded-host': 'app.example.com', 'x-forwarded-proto': 'https' } }).passed, true);
+  assert.equal(run(g, { headers: { origin: 'https://evil.example.com', 'x-forwarded-host': 'app.example.com', 'x-forwarded-proto': 'https' } }).passed, false);
+  assert.equal(run(g, { headers: { 'sec-fetch-site': 'cross-site', origin: 'https://app.example.com', 'x-forwarded-host': 'app.example.com' } }).passed, false);
+});
+

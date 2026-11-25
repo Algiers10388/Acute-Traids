@@ -402,6 +402,7 @@ export type FiatTransactionType =
   | 'BANK_ACH_DEPOSIT'
   | 'BANK_WIRE_DEPOSIT'
   | 'CHECK_MOBILE_DEPOSIT'
+  | 'CRYPTO_LIQUIDATION'
   | 'WITHDRAW_TO_BANK'
   | 'WITHDRAW_TO_DEBIT_CARD'
   | 'WITHDRAW_TO_PAYPAL'
@@ -411,6 +412,7 @@ export type FiatTransactionType =
 
 export interface CheckDepositRecord {
   id: string;
+  externalId?: string;
   checkNumber: string;
   payerName: string;
   issuingBank: string;
@@ -453,9 +455,18 @@ export interface FiatTransaction {
     | 'WIRE_TRANSFER'
     | 'MOBILE_CHECK_RDC'
     | 'INSTANT_CHECK_CLEARING'
+    | 'EXCHANGE_SPOT_SELL'
     | 'PAYPAL_PAYOUT';
   /** Processor-side id (e.g. PayPal payout_batch_id) used to reconcile status. */
   externalId?: string;
+  cryptoLiquidation?: {
+    exchange: string;
+    symbol: string;
+    quantity: number;
+    unitPriceUsd: number;
+    exchangeOrderId: string;
+    positionId?: string;
+  };
 }
 
 export interface FiatAccount {

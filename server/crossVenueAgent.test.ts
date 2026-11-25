@@ -12,7 +12,7 @@ import {
   type DualVenueCorridorOpportunity,
 } from './crossVenueAgent.ts';
 
-const PROFIT_VAULT = '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b';
+const PROFIT_VAULT = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
 const SIGNER_ADDR = '0x1111111111111111111111111111111111111111';
 
 function makeEthCorridor(overrides?: Partial<DualVenueCorridorOpportunity>): DualVenueCorridorOpportunity {

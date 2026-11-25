@@ -121,3 +121,185 @@ export async function fetchExchangeHealthCheck(): Promise<ExchangeHealthCheckSum
   return data.healthSummary;
 }
 
+export interface VaultTokenHolding {
+  symbol: string;
+  address: string;
+  decimals: number;
+  balance: string;
+  rawBalance: string;
+  hasBalance: boolean;
+  usdValue: number | null;
+}
+
+export interface VaultChainBalances {
+  success: boolean;
+  chain: string;
+  chainName: string;
+  chainId: number;
+  chainIdHex: string;
+  explorer: string;
+  vaultAddress: string;
+  profitVaultDefault: string;
+  gasWalletDefault: string | null;
+  hasServerSignerForVault: boolean;
+  serverSignerAddress: string | null;
+  native: {
+    symbol: string;
+    balance: string;
+    rawWei: string;
+    usdValue: number | null;
+  };
+  tokens: VaultTokenHolding[];
+  totalUsd: number;
+  timestamp: number;
+  chainMismatchNotice?: string | null;
+  suggestedChain?: string;
+  arbitrumEquivalent?: string;
+}
+
+export interface ExchangeDepositAddressResult {
+  success: boolean;
+  exchange: ExchangeId;
+  chain: string;
+  asset: string;
+  depositAddress: string | null;
+  source: 'EXCHANGE_API' | 'LINKED_WALLET_ADDRESS' | null;
+  method: string | null;
+  addresses: Array<{ address: string; method?: string; new?: boolean }>;
+  requiresAddressOrKeys?: boolean;
+  hint?: string;
+  error?: string;
+}
+
+export interface VaultExchangeTransferResult {
+  success: boolean;
+  mode: 'BROADCASTED' | 'UNSIGNED_TX';
+  requiresWalletSigning?: boolean;
+  signerRequired?: string;
+  chain: string;
+  chainName: string;
+  exchange: string;
+  sourceVaultAddress: string;
+  depositAddress: string;
+  asset: string;
+  tokenAddress?: string;
+  amount: string;
+  txHash?: string;
+  blockNumber?: number;
+  gasUsed?: string;
+  explorerUrl?: string;
+  transaction?: ExchangeWalletTransaction;
+  unsignedTx?: {
+    from: string;
+    to: string;
+    value: string;
+    data: string;
+    gas: string;
+    chainId: number;
+    chainIdHex: string;
+  };
+  message: string;
+}
+
+async function parseApiJson(res: Response, fallback: string) {
+  const text = await res.text();
+  let data: any = {};
+  if (text && text.trim()) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Unexpected response from gateway (HTTP ${res.status}).`);
+    }
+  }
+  if (!res.ok || data?.success === false) {
+    const err: any = new Error(data?.error || data?.message || `${fallback} (HTTP ${res.status})`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+export async function fetchExchangeDepositAddress(params: {
+  exchange: string;
+  asset: string;
+  chain: string;
+  createNew?: boolean;
+}): Promise<ExchangeDepositAddressResult> {
+  const qs = new URLSearchParams({
+    exchange: params.exchange,
+    asset: params.asset,
+    chain: params.chain,
+    ...(params.createNew ? { createNew: '1' } : {}),
+  });
+  const res = await fetch(`/api/exchange/deposit-address?${qs.toString()}`, {
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  return parseApiJson(res, `Failed to fetch ${params.exchange} deposit address`);
+}
+
+export async function fetchVaultChainBalances(params: {
+  chain: string;
+  vaultAddress?: string;
+  extraTokens?: string[];
+}): Promise<VaultChainBalances> {
+  const qs = new URLSearchParams({
+    chain: params.chain,
+    ...(params.vaultAddress ? { vaultAddress: params.vaultAddress } : {}),
+    ...(params.extraTokens?.length ? { extraTokens: params.extraTokens.join(',') } : {}),
+  });
+  const res = await fetch(`/api/flash-arb/vault/balances?${qs.toString()}`, {
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  return parseApiJson(res, 'Failed to query Vault balances');
+}
+
+export async function transferVaultToExchange(payload: {
+  chain: string;
+  exchange: string;
+  sourceVaultAddress: string;
+  depositAddress: string;
+  assetSymbol: string;
+  tokenAddress?: string;
+  amount: string;
+  sourcePrivateKey?: string;
+  sourcePassphrase?: string;
+}): Promise<VaultExchangeTransferResult> {
+  const res = await fetch('/api/flash-arb/vault/transfer-to-exchange', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Vault-to-exchange transfer failed');
+}
+
+export async function confirmVaultTransferTx(payload: {
+  chain: string;
+  txHash: string;
+  exchange: string;
+  sourceVaultAddress: string;
+  depositAddress: string;
+  assetSymbol: string;
+  amount: string;
+}): Promise<{
+  success: boolean;
+  txHash: string;
+  blockNumber: number;
+  gasUsed: string;
+  explorerUrl: string;
+  transaction: ExchangeWalletTransaction;
+  message: string;
+}> {
+  const res = await fetch('/api/flash-arb/vault/transfer-confirm', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Could not confirm transaction on-chain');
+}
+
+

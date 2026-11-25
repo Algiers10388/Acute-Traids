@@ -1,5 +1,5 @@
-import fs from "fs";
 import path from "path";
+import { isLedgerEncryptionEnabled, readStoreJson, writeStoreJson } from "./ledgerCrypto.ts";
 
 /**
  * Minimal Plaid REST client (no SDK) plus a private store for Plaid access tokens.
@@ -80,19 +80,25 @@ const STORE_PATH = () => process.env.PLAID_STORE_PATH || path.join(process.cwd()
 
 function readAll(): Record<string, PlaidItemRecord> {
   try {
-    if (fs.existsSync(STORE_PATH())) return JSON.parse(fs.readFileSync(STORE_PATH(), "utf8"));
+    const p = STORE_PATH();
+    const loaded = readStoreJson<Record<string, PlaidItemRecord>>(p, "plaid-items");
+    if (!loaded) return {};
+    if (loaded.wasPlaintext && isLedgerEncryptionEnabled()) {
+      writeStoreJson(p, loaded.data, "plaid-items");
+    }
+    return loaded.data || {};
   } catch (err) {
     console.error(`[plaid] FATAL: could not read ${STORE_PATH()}:`, err);
-    throw new Error(`Plaid item store at ${STORE_PATH()} is unreadable. Fix or restore it before linking or debiting banks.`);
+    throw new Error(
+      err instanceof Error && err.message.includes("FIAT_LEDGER_ENCRYPTION_KEY")
+        ? err.message
+        : `Plaid item store at ${STORE_PATH()} is unreadable. Fix or restore it before linking or debiting banks.`
+    );
   }
-  return {};
 }
 
 function writeAll(all: Record<string, PlaidItemRecord>) {
-  fs.mkdirSync(path.dirname(STORE_PATH()), { recursive: true });
-  const tmp = STORE_PATH() + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, STORE_PATH());
+  writeStoreJson(STORE_PATH(), all, "plaid-items");
 }
 
 export const plaidStore = {

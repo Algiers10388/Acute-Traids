@@ -45,7 +45,7 @@ function makeDummyCandidate(label: string, amountUnits = 1_000_000n): EncodedArb
     feeB: 500,
     routeType: 1,
     minProfitUnits: 1n,
-    recipient: '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b',
+    recipient: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
     calldata: '0x23b3aa6b',
   };
 }

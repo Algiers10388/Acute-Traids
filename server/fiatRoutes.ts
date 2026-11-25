@@ -3,7 +3,19 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { plaidConfig, plaidRequest, plaidStore } from "./plaidClient.ts";
-import { paypalConfig, paypalRequest } from "./paypalClient.ts";
+import { getPaypalDiagnostics, paypalConfig, paypalRequest, verifyPaypalPayoutAuth } from "./paypalClient.ts";
+import { increaseConfig, increaseRequest, resolveIncreaseAccountId, uploadIncreaseCheckFile } from "./increaseClient.ts";
+import { isLedgerEncryptionEnabled, readStoreJson, writeStoreJson } from "./ledgerCrypto.ts";
+import {
+  executeAuthenticatedSpotSell,
+  getExchangeTradingReadiness,
+  isExchangeConfigured,
+  liveTradingAllowed,
+  LIVE_TRADING_DISABLED_MSG,
+  quoteSpotSellUsd,
+  SUPPORTED_SPOT_EXCHANGES,
+  type SpotExchangeId,
+} from "./liveSpotExecutor.ts";
 import type {
   FiatAccount,
   FiatTransaction,
@@ -46,11 +58,43 @@ interface LedgerState {
 }
 
 const LEDGER_PATH = process.env.FIAT_LEDGER_PATH || path.join(process.cwd(), "data", "fiat-ledger.json");
+const TOTP_STORE_PATH = () => process.env.FIAT_TOTP_STORE_PATH || path.join(path.dirname(LEDGER_PATH), "fiat-totp.json");
 const DAILY_DEPOSIT_LIMIT = Number(process.env.FIAT_DAILY_DEPOSIT_LIMIT_USD || 50000);
 const MAX_TX_HISTORY = 500;
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 const todayUtc = () => new Date().toISOString().slice(0, 10);
+
+function readEnrolledTotpSecret(): string | null {
+  try {
+    const p = TOTP_STORE_PATH();
+    const loaded = readStoreJson<{ secret?: string }>(p, "fiat-totp");
+    if (!loaded) return null;
+    if (loaded.wasPlaintext && isLedgerEncryptionEnabled()) {
+      writeStoreJson(p, loaded.data, "fiat-totp");
+    }
+    const data = loaded.data;
+    return typeof data?.secret === "string" && data.secret.trim().length >= 16 ? data.secret.trim() : null;
+  } catch (err: any) {
+    if (err?.message?.includes("FIAT_LEDGER_ENCRYPTION_KEY")) throw err;
+    return null;
+  }
+}
+
+function writeEnrolledTotpSecret(secret: string) {
+  const p = TOTP_STORE_PATH();
+  writeStoreJson(p, { secret, enrolledAt: Date.now() }, "fiat-totp");
+}
+
+function totpManagedByEnv(): boolean {
+  return Boolean(process.env.FIAT_TOTP_SECRET?.trim());
+}
+
+export function getActiveTotpSecret(): string | null {
+  const envSecret = process.env.FIAT_TOTP_SECRET?.trim();
+  if (envSecret) return envSecret;
+  return readEnrolledTotpSecret();
+}
 
 function defaultState(): LedgerState {
   return {
@@ -66,8 +110,8 @@ function defaultState(): LedgerState {
       dailyDepositLimit: DAILY_DEPOSIT_LIMIT,
       dailyDepositUsed: 0,
       kycTier: "TIER_1_STANDARD",
-      twoFactorEnabled: Boolean(process.env.FIAT_TOTP_SECRET),
-      vaultEncryption: "NONE",
+      twoFactorEnabled: Boolean(getActiveTotpSecret()),
+      vaultEncryption: isLedgerEncryptionEnabled() ? "AES_256_GCM" : "NONE",
       fdicCustodyInsured: false,
       linkedBanks: [],
       linkedCards: [],
@@ -96,10 +140,12 @@ function defaultState(): LedgerState {
 
 function loadState(): LedgerState {
   const base = defaultState();
+  const encAtRest = isLedgerEncryptionEnabled();
   try {
-    if (fs.existsSync(LEDGER_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
-      return {
+    const loaded = readStoreJson<Partial<LedgerState>>(LEDGER_PATH, "fiat-ledger");
+    if (loaded) {
+      const raw = loaded.data;
+      const hydrated: LedgerState = {
         ...base,
         ...raw,
         account: {
@@ -107,16 +153,24 @@ function loadState(): LedgerState {
           ...raw.account,
           linkedBanks: Array.isArray(raw.account?.linkedBanks) ? raw.account.linkedBanks : [],
           linkedCards: [],
-          vaultEncryption: "NONE",
+          vaultEncryption: encAtRest ? "AES_256_GCM" : "NONE",
           fdicCustodyInsured: false,
         },
         botSecurity: { ...base.botSecurity, ...raw.botSecurity, securityGrade: "GUARDED" },
       };
+      if (loaded.wasPlaintext && encAtRest) {
+        writeStoreJson(LEDGER_PATH, hydrated, "fiat-ledger");
+      }
+      return hydrated;
     }
   } catch (err) {
-    // A corrupt ledger must not silently reset to zero while real money may be in it.
+    // A corrupt or key-locked ledger must not silently reset to zero while real money may be in it.
     console.error(`[fiat] FATAL: could not read ledger at ${LEDGER_PATH}:`, err);
-    throw new Error(`Fiat ledger at ${LEDGER_PATH} is unreadable. Fix or restore it before starting the server.`);
+    throw new Error(
+      err instanceof Error && err.message.includes("FIAT_LEDGER_ENCRYPTION_KEY")
+        ? err.message
+        : `Fiat ledger at ${LEDGER_PATH} is unreadable. Fix or restore it before starting the server.`
+    );
   }
   return base;
 }
@@ -124,10 +178,7 @@ function loadState(): LedgerState {
 let state: LedgerState = loadState();
 
 function persist() {
-  fs.mkdirSync(path.dirname(LEDGER_PATH), { recursive: true });
-  const tmp = LEDGER_PATH + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, LEDGER_PATH);
+  writeStoreJson(LEDGER_PATH, state, "fiat-ledger");
 }
 
 function rollDailyWindow() {
@@ -161,14 +212,33 @@ export function getBotSecuritySettings(): BotSecuritySettings {
 // TOTP (RFC 6238, SHA-1, 6 digits, 30 s step)
 // ---------------------------------------------------------------------------------------------------------------
 
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(buf: Buffer): string {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    out += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+  return out;
+}
+
 function base32Decode(input: string): Buffer {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   const clean = input.replace(/=+$/, "").replace(/\s+/g, "").toUpperCase();
   let bits = 0;
   let value = 0;
   const out: number[] = [];
   for (const ch of clean) {
-    const idx = alphabet.indexOf(ch);
+    const idx = BASE32_ALPHABET.indexOf(ch);
     if (idx < 0) throw new Error("FIAT_TOTP_SECRET is not valid base32");
     value = (value << 5) | idx;
     bits += 5;
@@ -202,6 +272,8 @@ export function verifyTotp(secretBase32: string, code: string, nowMs = Date.now(
   return null;
 }
 
+let pendingTotpSetup: { secret: string; createdAt: number } | null = null;
+
 type TwoFaResult = { ok: true } | { ok: false; status: number; body: Record<string, unknown> };
 
 /** Checks a TOTP code (single use). Returns ok when 2FA is not enforced or the amount is under the threshold. */
@@ -209,14 +281,15 @@ function checkTwoFactor(code: unknown, amountUsd: number, thresholdUsd: number, 
   if (!state.botSecurity.twoFactorEnforced) return { ok: true };
   if (!force && amountUsd < thresholdUsd) return { ok: true };
 
-  const secret = process.env.FIAT_TOTP_SECRET;
+  const secret = getActiveTotpSecret();
   if (!secret) {
     return {
       ok: false,
       status: 503,
       body: {
         success: false,
-        error: "2FA is enforced but FIAT_TOTP_SECRET is not configured on the server, so this action is refused. Set it in .env (base32 TOTP secret) and restart.",
+        twoFactorSetupRequired: true,
+        error: "2FA is enforced, but no authenticator secret is configured on the server yet. Set up 2FA in Security / Withdrawals (or set FIAT_TOTP_SECRET in .env).",
       },
     };
   }
@@ -388,6 +461,103 @@ export async function reconcilePaypalPayout(tx: FiatTransaction): Promise<"compl
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Remote Check Deposit Capture (Increase Check 21)
+// ---------------------------------------------------------------------------------------------------------------
+const MAX_CHECK_IMAGE_BYTES = 8 * 1024 * 1024;
+const ALLOWED_CHECK_MIME = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp"]);
+
+function decodeCheckImage(input: unknown, side: "front" | "back"): { buffer: Buffer; mimeType: string; ext: string } {
+  if (typeof input !== "string" || !input.trim()) {
+    throw Object.assign(new Error(`Check ${side} image is required.`), { status: 400 });
+  }
+  const trimmed = input.trim();
+  let mimeType = "image/jpeg";
+  let base64Payload = trimmed;
+
+  const dataUrlMatch = /^data:([^;,]+);base64,(.+)$/i.exec(trimmed);
+  if (dataUrlMatch) {
+    mimeType = dataUrlMatch[1].toLowerCase();
+    base64Payload = dataUrlMatch[2];
+  } else if (trimmed.startsWith("data:")) {
+    throw Object.assign(new Error(`Check ${side} image must be a base64-encoded JPEG, PNG, or WebP image.`), { status: 400 });
+  }
+
+  if (mimeType === "image/jpg") mimeType = "image/jpeg";
+  if (!ALLOWED_CHECK_MIME.has(mimeType)) {
+    throw Object.assign(new Error(`Unsupported ${side} check image type (${mimeType}). Use JPEG, PNG, or WebP.`), { status: 400 });
+  }
+
+  const buffer = Buffer.from(base64Payload, "base64");
+  if (buffer.length < 100) {
+    throw Object.assign(new Error(`Check ${side} image is empty or unreadable. Upload a clear photo of the check.`), { status: 400 });
+  }
+  if (buffer.length > MAX_CHECK_IMAGE_BYTES) {
+    throw Object.assign(new Error(`Check ${side} image exceeds the 8 MB limit.`), { status: 400 });
+  }
+
+  const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+  return { buffer, mimeType, ext };
+}
+
+function applyIncreaseCheckStatus(record: any, tx: FiatTransaction | undefined, deposit: any): "cleared" | "rejected" | "pending" {
+  const status = String(deposit?.status || "").toLowerCase();
+  const holdStatus = String(deposit?.inbound_funds_hold?.status || "").toLowerCase();
+  const holdActive = Boolean(deposit?.inbound_funds_hold) && holdStatus !== "released";
+
+  if (status === "rejected" || status === "returned") {
+    if (record.status === "PENDING_CLEARING") {
+      state.account.pendingBalance = Math.max(0, round2(state.account.pendingBalance - record.amount));
+    } else if (record.status === "CLEARED_INSTANT") {
+      // Check cleared first and was later returned unpaid by the issuing bank: reverse the credit.
+      if (record.destination === "BOT_MARGIN" && state.account.allocatedToTrading >= record.netAmount) {
+        state.account.allocatedToTrading = round2(state.account.allocatedToTrading - record.netAmount);
+      } else {
+        state.account.availableBalance = Math.max(0, round2(state.account.availableBalance - record.netAmount));
+      }
+    }
+    record.status = "REJECTED";
+    if (tx) {
+      tx.status = "FAILED";
+      tx.timestamp = Date.now();
+    }
+    persist();
+    return "rejected";
+  }
+
+  if (status === "submitted" && !holdActive) {
+    if (record.status === "PENDING_CLEARING") {
+      state.account.pendingBalance = Math.max(0, round2(state.account.pendingBalance - record.amount));
+      rollDailyWindow();
+      const toBot = record.destination === "BOT_MARGIN" && !state.botSecurity.emergencyFreezeActive;
+      if (toBot) {
+        state.account.allocatedToTrading = round2(state.account.allocatedToTrading + record.netAmount);
+      } else {
+        state.account.availableBalance = round2(state.account.availableBalance + record.netAmount);
+      }
+      state.account.dailyDepositUsed = round2(state.account.dailyDepositUsed + record.amount);
+      record.status = "CLEARED_INSTANT";
+      record.clearedAt = Date.now();
+      if (tx) {
+        tx.status = "COMPLETED";
+        tx.destinationName = toBot ? "Trading Bot Cash Balance" : "USD Ledger";
+        tx.timestamp = Date.now();
+      }
+      persist();
+    }
+    return "cleared";
+  }
+
+  return "pending";
+}
+
+export async function reconcileCheckDeposit(record: any): Promise<"cleared" | "rejected" | "pending"> {
+  if (!record?.externalId) return "pending";
+  const deposit = await increaseRequest("GET", `/check_deposits/${encodeURIComponent(record.externalId)}`);
+  const tx = state.transactions.find((t) => t.type === "CHECK_MOBILE_DEPOSIT" && t.externalId === record.externalId);
+  return applyIncreaseCheckStatus(record, tx, deposit);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -396,45 +566,44 @@ const NOT_AVAILABLE = (what: string, hint: string) => ({
   error: `${what} is not available: there is no live processor wired to it, so the server will not pretend it worked. ${hint}`,
 });
 
-function validateRoutingNumber(routing: string): boolean {
-  if (!/^\d{9}$/.test(routing)) return false;
-  const d = routing.split("").map(Number);
-  const checksum = (
-    3 * (d[0] + d[3] + d[6]) +
-    7 * (d[1] + d[4] + d[7]) +
-    1 * (d[2] + d[5] + d[8])
-  ) % 10;
-  return checksum === 0;
-}
-
 function accountPayload() {
   rollDailyWindow();
+  state.account.twoFactorEnabled = state.botSecurity.twoFactorEnforced && Boolean(getActiveTotpSecret());
+  state.account.vaultEncryption = isLedgerEncryptionEnabled() ? "AES_256_GCM" : "NONE";
   return state.account;
 }
 
 export function setupFiatRoutes(app: express.Application) {
   // 1. Account, config & status ------------------------------------------------------------------------------
   app.get("/api/fiat/account", (_req: Request, res: Response) => {
+    const totpConfigured = Boolean(getActiveTotpSecret());
+    const encAtRest = isLedgerEncryptionEnabled();
     res.json({
       success: true,
       account: accountPayload(),
       botSecurity: state.botSecurity,
       timestamp: Date.now(),
       security: {
-        vault: "LEDGER_FILE_PLAINTEXT",
+        vault: encAtRest ? "LEDGER_FILE_AES_256_GCM" : "LEDGER_FILE_PLAINTEXT",
+        encryptionAtRest: encAtRest,
         pciDssCompliant: false, // card data never touches this server (Stripe.js tokenizes it)
         fdicInsured: false,
-        twoFactorActive: Boolean(process.env.FIAT_TOTP_SECRET),
+        twoFactorActive: totpConfigured && state.botSecurity.twoFactorEnforced,
+        twoFactorConfigured: totpConfigured,
+        twoFactorManagedByEnv: totpManagedByEnv(),
         emergencyFreezeActive: state.botSecurity.emergencyFreezeActive,
         botOrderCapUsd: state.botSecurity.maxSingleOrderUsd,
         stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
         stripeWebhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
         plaidConfigured: Boolean(plaidConfig()),
+        increaseConfigured: Boolean(increaseConfig()),
       },
     });
   });
 
   app.get("/api/fiat/config", (_req: Request, res: Response) => {
+    rollDailyWindow();
+    const totpConfigured = Boolean(getActiveTotpSecret());
     res.json({
       success: true,
       stripe: {
@@ -442,11 +611,17 @@ export function setupFiatRoutes(app: express.Application) {
         publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null,
         webhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
       },
+      security: {
+        twoFactorConfigured: totpConfigured,
+        twoFactorEnforced: state.botSecurity.twoFactorEnforced,
+        managedByEnv: totpManagedByEnv(),
+      },
       rails: {
         card: Boolean(process.env.STRIPE_SECRET_KEY),
         bank: Boolean(plaidConfig() && process.env.STRIPE_SECRET_KEY),
         plaid: plaidConfig() ? { env: plaidConfig()!.env, oauthRedirectConfigured: Boolean(plaidConfig()!.redirectUri) } : null,
-        check: true,
+        check: Boolean(increaseConfig()),
+        increase: increaseConfig() ? { env: increaseConfig()!.env, envNotice: increaseConfig()!.envNotice || null } : null,
         withdrawals: paypalReady(),
         paypal: paypalReady()
           ? {
@@ -454,8 +629,13 @@ export function setupFiatRoutes(app: express.Application) {
               recipients: paypalRecipients().map((e, id) => ({ id, label: maskEmail(e) })),
               dailyLimitUsd: withdrawalDailyLimit(),
               withdrawnTodayUsd: state.dailyWithdrawnUsd,
+              diagnostics: getPaypalDiagnostics(),
             }
           : null,
+        cryptoToCash: {
+          paypalReady: paypalReady(),
+          ...getExchangeTradingReadiness(),
+        },
       },
     });
   });
@@ -463,16 +643,17 @@ export function setupFiatRoutes(app: express.Application) {
   // 1b. Security audit: computed from real state, no fixed grades or compliance claims --------------------------
   app.get("/api/fiat/security/audit", (_req: Request, res: Response) => {
     const bs = state.botSecurity;
-    const totpOk = Boolean(process.env.FIAT_TOTP_SECRET);
+    const totpOk = Boolean(getActiveTotpSecret());
     const stripeOk = Boolean(process.env.STRIPE_SECRET_KEY);
     const hookOk = Boolean(process.env.STRIPE_WEBHOOK_SECRET);
     const liveGate = process.env.ENABLE_LIVE_TRADING === "1";
+    const encAtRest = isLedgerEncryptionEnabled();
     const checks: SecurityAuditReport["verifiedChecks"] = [
       {
         title: "Two-factor (TOTP) secret configured",
         description: totpOk
-          ? "FIAT_TOTP_SECRET is set; high-value transfers verify a real, single-use TOTP code."
-          : "FIAT_TOTP_SECRET is not set. With 2FA enforced, high-value transfers are refused until it is configured.",
+          ? "A verified TOTP authenticator secret is active; high-value transfers and withdrawals verify a single-use 6-digit code."
+          : "No TOTP secret is enrolled yet. Set up an authenticator in Security or Withdrawals before running 2FA-protected actions.",
         status: totpOk ? "PASSED" : "WARNING",
         category: "ACCESS_CONTROL",
       },
@@ -519,9 +700,11 @@ export function setupFiatRoutes(app: express.Application) {
         category: "BOT_TREASURY",
       },
       {
-        title: "Ledger not encrypted at rest",
-        description: `Balances are stored in ${LEDGER_PATH} (file mode 600, not encrypted). It holds no card or bank credentials.`,
-        status: "WARNING",
+        title: encAtRest ? "Ledger encrypted at rest (AES-256-GCM)" : "Ledger not encrypted at rest",
+        description: encAtRest
+          ? `Balances, TOTP secret, and Plaid tokens in ${path.dirname(LEDGER_PATH)} are encrypted at rest with AES-256-GCM (scrypt KDF, file mode 600).`
+          : `Balances in ${LEDGER_PATH} are stored in plaintext (file mode 600). Set FIAT_LEDGER_ENCRYPTION_KEY in .env to encrypt ./data at rest with AES-256-GCM.`,
+        status: encAtRest ? "PASSED" : "WARNING",
         category: "ENCRYPTION",
       },
     ];
@@ -529,7 +712,7 @@ export function setupFiatRoutes(app: express.Application) {
     const report: SecurityAuditReport = {
       overallScore: Math.max(0, Math.round(100 - (warnings * 100) / checks.length)),
       securityGrade: "GUARDED",
-      vaultEncryption: "None (plain JSON ledger, file mode 600)",
+      vaultEncryption: encAtRest ? "AES-256-GCM (scrypt + file mode 600)" : "None (plain JSON ledger, file mode 600)",
       twoFactorActive: totpOk && bs.twoFactorEnforced,
       emergencyFreezeActive: bs.emergencyFreezeActive,
       totalLinkedBanks: 0,
@@ -579,7 +762,7 @@ export function setupFiatRoutes(app: express.Application) {
         if (b[k] !== undefined) bs[k] = Number(b[k]);
       }
       bs.lastSecurityAuditTimestamp = Date.now();
-      state.account.twoFactorEnabled = bs.twoFactorEnforced && Boolean(process.env.FIAT_TOTP_SECRET);
+      state.account.twoFactorEnabled = bs.twoFactorEnforced && Boolean(getActiveTotpSecret());
       persist();
 
       return res.json({
@@ -595,11 +778,78 @@ export function setupFiatRoutes(app: express.Application) {
     }
   });
 
-  // 1d. Verify a TOTP code (stateless check; endpoints that need 2FA verify the code themselves) ----------------
+  // 1d. TOTP Authenticator Enrollment (used when FIAT_TOTP_SECRET is not set in server .env) ----------------
+  app.post("/api/fiat/security/totp/setup", (req: Request, res: Response) => {
+    if (totpManagedByEnv()) {
+      return res.status(409).json({
+        success: false,
+        error: "2FA is configured via FIAT_TOTP_SECRET in server environment (.env) and cannot be changed from the browser.",
+      });
+    }
+    const existing = readEnrolledTotpSecret();
+    if (existing) {
+      const given = String(req.body?.twoFactorCode ?? "").trim();
+      const counter = verifyTotp(existing, given);
+      if (counter === null || counter <= state.lastTotpCounter) {
+        return res.status(403).json({
+          success: false,
+          requires2FA: true,
+          error: "Enter your current 6-digit 2FA code to rotate the authenticator secret.",
+        });
+      }
+      state.lastTotpCounter = counter;
+      persist();
+    }
+    const secret = base32Encode(crypto.randomBytes(20));
+    pendingTotpSetup = { secret, createdAt: Date.now() };
+    const issuer = "Onset-Traids";
+    const accountLabel = state.account.accountId || "Trading Ledger";
+    const otpauthUri = `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(accountLabel)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+    return res.json({
+      success: true,
+      secret,
+      otpauthUri,
+      issuer,
+      accountLabel,
+      message: "Scan the QR code (or copy the secret key) in Google Authenticator / Authy, then confirm with a 6-digit code.",
+    });
+  });
+
+  app.post("/api/fiat/security/totp/confirm", (req: Request, res: Response) => {
+    if (totpManagedByEnv()) {
+      return res.status(409).json({ success: false, error: "2FA is managed via FIAT_TOTP_SECRET in server environment (.env)." });
+    }
+    if (!pendingTotpSetup || Date.now() - pendingTotpSetup.createdAt > 10 * 60_000) {
+      pendingTotpSetup = null;
+      return res.status(400).json({ success: false, error: "No active 2FA setup session (or it expired). Generate a new setup key first." });
+    }
+    const code = String(req.body?.code ?? "").trim();
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({ success: false, error: "Enter the 6-digit code from your authenticator app." });
+    }
+    const counter = verifyTotp(pendingTotpSetup.secret, code);
+    if (counter === null) {
+      return res.status(403).json({ success: false, error: "Code did not match the pending authenticator secret. Check device clock and try again." });
+    }
+    writeEnrolledTotpSecret(pendingTotpSetup.secret);
+    pendingTotpSetup = null;
+    state.lastTotpCounter = counter;
+    state.account.twoFactorEnabled = state.botSecurity.twoFactorEnforced;
+    persist();
+    return res.json({
+      success: true,
+      twoFactorConfigured: true,
+      account: accountPayload(),
+      botSecurity: state.botSecurity,
+      message: "2FA authenticator verified and active. Withdrawals are now unlocked.",
+    });
+  });
+
+  // 1e. Verify a TOTP code (stateless check; endpoints that need 2FA verify the code themselves) ----------------
   app.post("/api/fiat/security/verify-2fa", (req: Request, res: Response) => {
-    const secret = process.env.FIAT_TOTP_SECRET;
+    const secret = getActiveTotpSecret();
     if (!secret) {
-      return res.status(503).json({ success: false, verified: false, error: "FIAT_TOTP_SECRET is not configured on the server." });
+      return res.status(503).json({ success: false, verified: false, error: "No 2FA authenticator secret is configured on the server yet." });
     }
     const code = String(req.body?.code ?? "").trim();
     if (!/^\d{6}$/.test(code)) {
@@ -1171,7 +1421,7 @@ export function setupFiatRoutes(app: express.Application) {
       if (typeof idempotencyKey !== "string" || idempotencyKey.length < 8) {
         return res.status(400).json({ success: false, error: "An idempotencyKey (8+ characters) is required so a retry can never pay twice." });
       }
-      const senderBatchId = `wd-${crypto.createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 24)}`;
+      const senderBatchId = `wd${crypto.createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 24)}`;
 
       // Same request again (double-click, retry): return what already happened. No new reservation, no 2FA use.
       const prior = state.transactions.find((t) => t.type === "WITHDRAW_TO_PAYPAL" && t.referenceHash === senderBatchId);
@@ -1280,10 +1530,35 @@ export function setupFiatRoutes(app: express.Application) {
           });
         }
         refundWithdrawal(tx); // PayPal definitively refused it: nothing left, put the money back
-        return res.status(err.status || 400).json({ success: false, error: err.message, code: err.paypal?.name, account: accountPayload() });
+        return res.status(err.status || 400).json({
+          success: false,
+          error: err.message,
+          code: err.paypal?.name,
+          paypal: err.paypal || null,
+          account: accountPayload(),
+        });
       }
     } catch (err: any) {
       return res.status(err.status || 500).json({ success: false, error: err.message || "Withdrawal failed" });
+    }
+  });
+
+  // Verify PayPal OAuth + Payouts scope & endpoint authorization without transferring funds
+  app.post("/api/fiat/paypal/verify", async (req: Request, res: Response) => {
+    try {
+      const forceRefresh = req.body?.forceRefresh !== false;
+      const result = await verifyPaypalPayoutAuth(forceRefresh);
+      const status = result.readProbeOk ? 200 : 403;
+      return res.status(status).json({
+        success: result.readProbeOk,
+        ...result,
+      });
+    } catch (err: any) {
+      return res.status(err.status || 500).json({
+        success: false,
+        error: err.message || "PayPal authorization verification failed.",
+        paypal: err.paypal || null,
+      });
     }
   });
 
@@ -1334,94 +1609,139 @@ export function setupFiatRoutes(app: express.Application) {
     return res.json({ received: true });
   });
 
-  // 6. Remote Deposit Capture (RDC) Check Cashing Implementation ------------------------------------------
+  // 6. Remote Check Deposit Capture (Increase Check 21 API) ----------------------------------------------------
   app.post("/api/fiat/deposit/check", async (req: Request, res: Response) => {
     try {
+      const cfg = increaseConfig();
+      if (!cfg) {
+        return res.status(503).json({
+          success: false,
+          code: "CHECK_PROCESSOR_UNCONFIGURED",
+          error:
+            "Remote check deposit requires a live Increase API connection: set INCREASE_API_KEY, INCREASE_ACCOUNT_ID, and INCREASE_ENV (sandbox|production) in .env.",
+        });
+      }
+
       const {
         amount,
-        payerName,
         checkNumber,
+        payerName,
+        issuingBank,
         routingNumber,
         accountNumber,
-        issuingBank,
-        settlementSpeed,
-        directToBot = false,
         endorsementConfirmed,
-        twoFactorCode,
+        destination,
+        frontImage,
+        backImage,
+        idempotencyKey,
       } = req.body || {};
 
-      if (!endorsementConfirmed) {
-        return res.status(400).json({ success: false, error: "You must certify that the check is properly signed and endorsed for mobile deposit." });
-      }
       const numAmount = round2(Number(amount));
-      if (!Number.isFinite(numAmount) || numAmount < 1.0) {
-        return res.status(400).json({ success: false, error: "Minimum check cashing amount is $1.00 USD." });
-      }
-      if (numAmount > 10000.0) {
-        return res.status(400).json({ success: false, error: "Maximum single check deposit is $10,000.00 USD." });
-      }
-      const payer = typeof payerName === "string" ? payerName.trim() : "";
-      if (payer.length < 2) {
-        return res.status(400).json({ success: false, error: "Please specify the payer name written on the check." });
-      }
-      const chkNum = typeof checkNumber === "string" ? checkNumber.trim() : "1001";
-      const routing = typeof routingNumber === "string" ? routingNumber.trim() : "";
-      if (!validateRoutingNumber(routing)) {
-        return res.status(400).json({ success: false, error: "Invalid ABA routing number checksum. Provide a valid 9-digit routing number." });
-      }
-      const acctNum = typeof accountNumber === "string" ? accountNumber.trim() : "1234";
-      if (acctNum.length < 4) {
-        return res.status(400).json({ success: false, error: "Provide a valid bank account number." });
+      if (!Number.isFinite(numAmount) || numAmount < 1 || numAmount > 25_000) {
+        return res.status(400).json({ success: false, error: "Check amount must be between $1.00 and $25,000.00 USD." });
       }
 
-      if (directToBot && state.botSecurity.emergencyFreezeActive) {
-        return res.status(403).json({ success: false, error: "Emergency kill switch is active. Unfreeze before funding the bot." });
+      const cleanCheckNum = String(checkNumber ?? "").trim();
+      if (!/^[A-Za-z0-9-]{1,32}$/.test(cleanCheckNum)) {
+        return res.status(400).json({ success: false, error: "Enter a valid check number (1–32 alphanumeric characters)." });
+      }
+
+      const cleanPayer = String(payerName ?? "").trim();
+      if (cleanPayer.length < 2 || cleanPayer.length > 120) {
+        return res.status(400).json({ success: false, error: "Enter the check payer / drawer name (2–120 characters)." });
+      }
+
+      if (endorsementConfirmed !== true) {
+        return res.status(400).json({
+          success: false,
+          error: "Endorse the back of the check ('For Mobile Deposit Only') and confirm endorsement before submitting.",
+        });
+      }
+
+      const targetDest: "BOT_MARGIN" | "TREASURY_VAULT" = destination === "BOT_MARGIN" ? "BOT_MARGIN" : "TREASURY_VAULT";
+      if (targetDest === "BOT_MARGIN" && state.botSecurity.emergencyFreezeActive) {
+        return res.status(423).json({
+          success: false,
+          error: "Emergency freeze is active: direct-to-bot check deposits are blocked. Unfreeze or deposit to USD Ledger.",
+        });
       }
 
       rollDailyWindow();
       if (state.account.dailyDepositUsed + numAmount > state.account.dailyDepositLimit) {
         return res.status(400).json({
           success: false,
-          error: `Exceeds daily deposit limit ($${state.account.dailyDepositLimit.toLocaleString()}).`,
+          error: `Exceeds daily deposit limit of $${state.account.dailyDepositLimit.toLocaleString()}.`,
         });
       }
 
-      const refHash = crypto.createHash("sha256").update(`${routing}:${acctNum}:${chkNum}:${numAmount}`).digest("hex");
-      if ((state.checkDeposits || []).some((c: any) => c.referenceHash === refHash)) {
-        return res.status(409).json({ success: false, error: "Duplicate check deposit detected: this exact check number, amount, and account have already been deposited." });
+      const reqKey =
+        typeof idempotencyKey === "string" && idempotencyKey.trim().length >= 8
+          ? `chk-${crypto.createHash("sha256").update(idempotencyKey.trim()).digest("hex").slice(0, 24)}`
+          : `chk-${crypto.randomBytes(12).toString("hex")}`;
+
+      const existing = state.checkDeposits.find((c) => c.referenceHash === reqKey);
+      if (existing) {
+        const existingTx = state.transactions.find((t) => t.referenceHash === reqKey);
+        return res.status(200).json({
+          success: true,
+          duplicate: true,
+          check: existing,
+          transaction: existingTx,
+          account: accountPayload(),
+          message: `Check #${existing.checkNumber} was already submitted (status: ${existing.status}).`,
+        });
       }
 
-      const tf = checkTwoFactor(twoFactorCode, numAmount, 2000);
-      if (!tf.ok) return res.status(tf.status).json(tf.body);
+      const front = decodeCheckImage(frontImage, "front");
+      const back = decodeCheckImage(backImage, "back");
 
-      const feeUsd = settlementSpeed === 'INSTANT' ? round2(Math.max(1.00, numAmount * 0.015)) : 0.0;
-      const netUsd = round2(numAmount - feeUsd);
+      const frontFile = await uploadIncreaseCheckFile(
+        "check_image_front",
+        front.buffer,
+        front.mimeType,
+        `check-${cleanCheckNum}-front.${front.ext}`
+      );
+      const backFile = await uploadIncreaseCheckFile(
+        "check_image_back",
+        back.buffer,
+        back.mimeType,
+        `check-${cleanCheckNum}-back.${back.ext}`
+      );
 
-      if (directToBot) {
-        state.account.allocatedToTrading = round2(state.account.allocatedToTrading + netUsd);
-      } else {
-        state.account.availableBalance = round2(state.account.availableBalance + netUsd);
-      }
-      state.account.dailyDepositUsed = round2(state.account.dailyDepositUsed + numAmount);
+      const resolvedAccountId = await resolveIncreaseAccountId();
+      const deposit = await increaseRequest(
+        "POST",
+        "/check_deposits",
+        {
+          account_id: resolvedAccountId,
+          amount: Math.round(numAmount * 100),
+          front_image_file_id: frontFile.id,
+          back_image_file_id: backFile.id,
+          description: `Check #${cleanCheckNum} from ${cleanPayer}`.slice(0, 200),
+        },
+        reqKey
+      );
 
-      const checkRecord = {
+      const cleanRouting = String(routingNumber ?? "").replace(/\D/g, "");
+      const cleanAcct = String(accountNumber ?? "").replace(/\D/g, "");
+      const record: any = {
         id: newId("chk"),
-        timestamp: Date.now(),
+        externalId: deposit.id,
+        checkNumber: cleanCheckNum,
+        payerName: cleanPayer,
+        issuingBank: String(issuingBank ?? "").trim().slice(0, 120) || "Check Issuing Bank",
+        routingNumberMasked: cleanRouting.length >= 4 ? `••••${cleanRouting.slice(-4)}` : "MICR-RDC",
+        accountNumberMasked: cleanAcct.length >= 4 ? `••••${cleanAcct.slice(-4)}` : "MICR-RDC",
         amount: numAmount,
-        payerName: payer,
-        checkNumber: chkNum,
-        routingNumber: routing,
-        accountNumberMasked: `•••• ${acctNum.slice(-4)}`,
-        issuingBank: issuingBank || "US Commercial Bank",
-        status: "CLEARED",
-        feeUsd,
-        netUsd,
-        directToBot: Boolean(directToBot),
-        referenceHash: refHash,
+        fee: 0,
+        netAmount: numAmount,
+        settlementSpeed: "STANDARD_CLEARING",
+        status: "PENDING_CLEARING",
+        endorsementConfirmed: true,
+        destination: targetDest,
+        referenceHash: reqKey,
+        submittedAt: Date.now(),
       };
-
-      if (!state.checkDeposits) state.checkDeposits = [];
-      state.checkDeposits.unshift(checkRecord);
 
       const tx: FiatTransaction = {
         id: newId("tx-chk"),
@@ -1429,30 +1749,374 @@ export function setupFiatRoutes(app: express.Application) {
         type: "CHECK_MOBILE_DEPOSIT",
         amount: numAmount,
         currency: "USD",
-        fee: feeUsd,
-        netAmount: netUsd,
-        status: "COMPLETED",
-        sourceName: `Check #${chkNum} (${payer})`,
-        destinationName: directToBot ? "Trading Bot Cash Balance" : "USD Ledger",
-        referenceHash: refHash,
+        fee: 0,
+        netAmount: numAmount,
+        status: "PROCESSING",
+        sourceName: `Check #${cleanCheckNum} (${cleanPayer})`,
+        destinationName: targetDest === "BOT_MARGIN" ? "Trading Bot Cash Balance" : "USD Ledger",
+        referenceHash: reqKey,
         rail: "MOBILE_CHECK_RDC",
+        externalId: deposit.id,
       };
+
+      state.account.pendingBalance = round2(state.account.pendingBalance + numAmount);
+      state.checkDeposits.unshift(record);
+      if (state.checkDeposits.length > 200) state.checkDeposits = state.checkDeposits.slice(0, 200);
       pushTx(tx);
       persist();
 
-      return res.json({
+      const outcome = applyIncreaseCheckStatus(record, tx, deposit);
+      if (outcome === "rejected") {
+        return res.status(402).json({
+          success: false,
+          error: `Check #${cleanCheckNum} was rejected by clearing review (${deposit?.deposit_rejection?.reason || deposit?.status || "rejected"}).`,
+          check: record,
+          account: accountPayload(),
+        });
+      }
+
+      return res.status(outcome === "cleared" ? 200 : 202).json({
         success: true,
-        account: accountPayload(),
+        processing: outcome === "pending",
+        check: record,
         transaction: tx,
-        check: checkRecord,
-        message: `Check #${chkNum} for $${numAmount.toFixed(2)} successfully cashed via Remote Deposit Capture. Credited $${netUsd.toFixed(2)} USD (Fee: $${feeUsd.toFixed(2)}).`,
-        directToBot: Boolean(directToBot),
-        botCreditAmount: directToBot ? netUsd : undefined,
+        account: accountPayload(),
+        message:
+          outcome === "cleared"
+            ? `Check #${cleanCheckNum} for $${numAmount.toFixed(2)} USD cleared and credited to ${tx.destinationName}.`
+            : `Check #${cleanCheckNum} for $${numAmount.toFixed(2)} USD submitted for Check 21 clearing. Funds move from Pending into ${tx.destinationName} once Increase confirms settlement.`,
       });
     } catch (err: any) {
-      return res.status(500).json({ success: false, error: err.message || "Check cashing failed" });
+      return res.status(err.status || 500).json({
+        success: false,
+        error: err.message || "Check deposit failed",
+        code: err.increase?.code,
+      });
     }
   });
+
+  app.post("/api/fiat/check-deposits/reconcile", async (_req: Request, res: Response) => {
+    if (!increaseConfig()) {
+      return res.status(503).json({ success: false, error: "Check clearing (Increase) is not configured." });
+    }
+    const results: Record<string, string> = {};
+    for (const chk of state.checkDeposits.filter((c) => c.externalId && c.status !== "REJECTED")) {
+      try {
+        results[chk.id] = await reconcileCheckDeposit(chk);
+      } catch (err: any) {
+        results[chk.id] = `error: ${err.message}`;
+      }
+    }
+    return res.json({
+      success: true,
+      results,
+      checks: state.checkDeposits,
+      account: accountPayload(),
+      transactions: state.transactions,
+    });
+  });
+
+  // Increase webhook: never trusts event payload fields beyond associated_object_id; re-reads GET /check_deposits/:id.
+  app.post("/api/fiat/increase/webhook", async (req: Request, res: Response) => {
+    try {
+      const objId = req.body?.associated_object_id;
+      const chk = typeof objId === "string" ? state.checkDeposits.find((c) => c.externalId === objId) : undefined;
+      if (chk && increaseConfig()) {
+        await reconcileCheckDeposit(chk);
+      }
+    } catch (err: any) {
+      console.error("[fiat] Increase webhook reconcile failed:", err.message);
+      return res.status(500).json({ received: false });
+    }
+    return res.json({ received: true });
+  });
+
+  // 7. Crypto-to-Cash: Live Spot Liquidation -> PayPal Payout ------------------------------------------------
+  app.post("/api/fiat/crypto-to-cash/quote", async (req: Request, res: Response) => {
+    try {
+      const { exchange = "KRAKEN", symbol, quantity } = req.body || {};
+      const ex = String(exchange).toUpperCase() as SpotExchangeId;
+      if (!SUPPORTED_SPOT_EXCHANGES.includes(ex)) {
+        return res.status(400).json({ success: false, error: `Unsupported spot exchange '${exchange}'.` });
+      }
+      if (typeof symbol !== "string" || !symbol.trim()) {
+        return res.status(400).json({ success: false, error: "Crypto symbol (e.g. BTC/USDT) is required." });
+      }
+      const quote = await quoteSpotSellUsd({ exchange: ex, symbol, quantity: Number(quantity) });
+      const readiness = getExchangeTradingReadiness();
+      rollDailyWindow();
+      const dailyLimitUsd = withdrawalDailyLimit();
+      const remainingDailyUsd = Math.max(0, round2(dailyLimitUsd - state.dailyWithdrawnUsd));
+
+      return res.json({
+        success: true,
+        quote: {
+          ...quote,
+          exchangeConfigured: readiness.exchanges[ex]?.configured ?? false,
+          liveTradingEnabled: readiness.liveTradingEnabled,
+          paypalReady: paypalReady(),
+          withinSingleOrderCap: quote.grossUsd <= state.botSecurity.maxSingleOrderUsd,
+          withinDailyWithdrawalLimit: quote.netUsd <= remainingDailyUsd,
+          dailyLimitUsd,
+          remainingDailyUsd,
+          meetsPaypalMinimum: quote.netUsd >= 1,
+        },
+      });
+    } catch (err: any) {
+      return res.status(err?.status || 500).json({ success: false, error: err?.message || "Could not price crypto position." });
+    }
+  });
+
+  app.post("/api/fiat/crypto-to-cash", async (req: Request, res: Response) => {
+    try {
+      const { exchange = "KRAKEN", symbol, quantity, positionId, recipientId = 0, twoFactorCode, idempotencyKey } = req.body || {};
+
+      if (!paypalReady()) {
+        return res.status(503).json({
+          success: false,
+          error: "PayPal Payouts are not configured: set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_ENV, and PAYPAL_PAYOUT_RECIPIENTS.",
+        });
+      }
+      const recipients = paypalRecipients();
+      const idx = Number(recipientId);
+      const receiver = Number.isInteger(idx) ? recipients[idx] : undefined;
+      if (!receiver) {
+        return res.status(400).json({ success: false, error: "Select a registered PayPal payout recipient." });
+      }
+      if (typeof idempotencyKey !== "string" || idempotencyKey.trim().length < 8) {
+        return res.status(400).json({ success: false, error: "An idempotencyKey (8+ characters) is required so retries cannot double-sell or double-pay." });
+      }
+
+      const cleanIdem = idempotencyKey.trim();
+      const senderBatchId = `ctc${crypto.createHash("sha256").update(cleanIdem).digest("hex").slice(0, 24)}`;
+      const existingPayout = state.transactions.find((t) => t.type === "WITHDRAW_TO_PAYPAL" && t.referenceHash === senderBatchId);
+      const existingLiq = state.transactions.find((t) => t.type === "CRYPTO_LIQUIDATION" && t.referenceHash === `${senderBatchId}-sell`);
+      if (existingPayout || existingLiq) {
+        return res.status(existingPayout?.status === "FAILED" ? 409 : 200).json({
+          success: existingPayout ? existingPayout.status !== "FAILED" : true,
+          duplicate: true,
+          sellCompleted: Boolean(existingLiq),
+          liquidationTransaction: existingLiq || null,
+          payoutTransaction: existingPayout || null,
+          account: accountPayload(),
+          message: `This Crypto-to-Cash request was already processed (payout status: ${existingPayout?.status || "COMPLETED"}).`,
+        });
+      }
+
+      if (state.botSecurity.emergencyFreezeActive) {
+        return res.status(403).json({ success: false, error: "Emergency kill switch is active: live crypto liquidation and payouts are blocked." });
+      }
+      if (!liveTradingAllowed()) {
+        return res.status(403).json({ success: false, error: LIVE_TRADING_DISABLED_MSG });
+      }
+
+      const ex = String(exchange).toUpperCase() as SpotExchangeId;
+      if (!SUPPORTED_SPOT_EXCHANGES.includes(ex)) {
+        return res.status(400).json({ success: false, error: `Unsupported spot exchange '${exchange}'.` });
+      }
+      const qty = Number(quantity);
+      if (typeof symbol !== "string" || !symbol.trim() || !Number.isFinite(qty) || qty <= 0) {
+        return res.status(400).json({ success: false, error: "Provide a valid crypto symbol and positive spot quantity." });
+      }
+
+      // Pre-flight pricing and limits BEFORE burning a single-use 2FA code
+      const quote = await quoteSpotSellUsd({ exchange: ex, symbol, quantity: qty });
+      if (quote.netUsd < 1) {
+        return res.status(400).json({
+          success: false,
+          error: `Net USD proceeds ($${quote.netUsd.toFixed(2)}) are below the $1.00 PayPal minimum payout.`,
+        });
+      }
+      if (quote.grossUsd > state.botSecurity.maxSingleOrderUsd) {
+        return res.status(400).json({
+          success: false,
+          error: `Position value $${quote.grossUsd.toFixed(2)} exceeds single-order risk cap ($${state.botSecurity.maxSingleOrderUsd.toLocaleString()}).`,
+        });
+      }
+
+      rollDailyWindow();
+      const limit = withdrawalDailyLimit();
+      if (state.dailyWithdrawnUsd + quote.netUsd > limit) {
+        return res.status(400).json({
+          success: false,
+          error: `Estimated payout $${quote.netUsd.toFixed(2)} exceeds remaining daily withdrawal limit ($${Math.max(0, limit - state.dailyWithdrawnUsd).toFixed(2)} of $${limit.toLocaleString()}).`,
+        });
+      }
+
+      if (!isExchangeConfigured(ex)) {
+        return res.status(400).json({
+          success: false,
+          requiresCredentials: true,
+          error: `${ex} API credentials are required to liquidate spot crypto. Link your ${ex} API key & secret in Exchange Wallets first.`,
+        });
+      }
+
+      // Verify single-use TOTP before placing a real exchange sell order or sending PayPal money
+      const tf = checkTwoFactor(twoFactorCode, quote.netUsd, 0, true);
+      if (!tf.ok) return res.status(tf.status).json(tf.body);
+
+      // Step 1: Execute real spot SELL on the exchange (never fabricated)
+      const sellResult = await executeAuthenticatedSpotSell({
+        exchange: ex,
+        symbol: quote.symbol,
+        quantity: qty,
+        maxSingleOrderUsd: state.botSecurity.maxSingleOrderUsd,
+      });
+
+      const netProceedsUsd = round2(sellResult.netProceedsUsd);
+
+      // Credit verified exchange liquidation proceeds to USD ledger and persist immediately
+      state.account.availableBalance = round2(state.account.availableBalance + netProceedsUsd);
+      const liqTx: FiatTransaction = {
+        id: newId("tx-ctc-sell"),
+        timestamp: Date.now(),
+        type: "CRYPTO_LIQUIDATION",
+        amount: sellResult.grossUsd,
+        currency: "USD",
+        fee: sellResult.exchangeFeeUsd,
+        netAmount: netProceedsUsd,
+        status: "COMPLETED",
+        sourceName: `${qty} ${sellResult.symbol} @ $${sellResult.unitPriceUsd.toLocaleString()} (${ex})`,
+        destinationName: "USD Ledger (Crypto-to-Cash)",
+        referenceHash: `${senderBatchId}-sell`,
+        rail: "EXCHANGE_SPOT_SELL",
+        externalId: sellResult.exchangeOrderId,
+        cryptoLiquidation: {
+          exchange: ex,
+          symbol: sellResult.symbol,
+          quantity: qty,
+          unitPriceUsd: sellResult.unitPriceUsd,
+          exchangeOrderId: sellResult.exchangeOrderId,
+          ...(typeof positionId === "string" && positionId.trim() ? { positionId: positionId.trim() } : {}),
+        },
+      };
+      pushTx(liqTx);
+
+      if (netProceedsUsd < 1) {
+        persist();
+        return res.status(400).json({
+          success: false,
+          sellCompleted: true,
+          sellResult,
+          liquidationTransaction: liqTx,
+          account: accountPayload(),
+          error: `Spot sale settled for $${netProceedsUsd.toFixed(2)} USD (credited to USD Ledger), which is below the $1.00 PayPal minimum payout.`,
+        });
+      }
+
+      // Re-check daily withdrawal limit against actual settled proceeds
+      if (state.dailyWithdrawnUsd + netProceedsUsd > limit) {
+        persist();
+        return res.status(400).json({
+          success: false,
+          sellCompleted: true,
+          sellResult,
+          liquidationTransaction: liqTx,
+          account: accountPayload(),
+          error: `Spot crypto sold for $${netProceedsUsd.toFixed(2)} USD (credited to USD Ledger), but payout exceeds daily withdrawal limit ($${limit.toLocaleString()}). Withdraw later from USD Ledger.`,
+        });
+      }
+
+      // Step 2: Reserve exact proceeds and persist BEFORE calling PayPal Payouts
+      state.account.availableBalance = round2(state.account.availableBalance - netProceedsUsd);
+      state.dailyWithdrawnUsd = round2(state.dailyWithdrawnUsd + netProceedsUsd);
+      const payoutTx: FiatTransaction = {
+        id: newId("tx-pp"),
+        timestamp: Date.now(),
+        type: "WITHDRAW_TO_PAYPAL",
+        amount: netProceedsUsd,
+        currency: "USD",
+        fee: 0,
+        netAmount: netProceedsUsd,
+        status: "PROCESSING",
+        sourceName: `Crypto-to-Cash (${qty} ${sellResult.symbol})`,
+        destinationName: `PayPal ${maskEmail(receiver)}`,
+        referenceHash: senderBatchId,
+        rail: "PAYPAL_PAYOUT",
+        cryptoLiquidation: {
+          exchange: ex,
+          symbol: sellResult.symbol,
+          quantity: qty,
+          unitPriceUsd: sellResult.unitPriceUsd,
+          exchangeOrderId: sellResult.exchangeOrderId,
+          ...(typeof positionId === "string" && positionId.trim() ? { positionId: positionId.trim() } : {}),
+        },
+      };
+      pushTx(payoutTx);
+      persist();
+
+      try {
+        const out = await paypalRequest(
+          "POST",
+          "/v1/payments/payouts",
+          {
+            sender_batch_header: {
+              sender_batch_id: senderBatchId,
+              email_subject: `Crypto-to-Cash Payout ($${netProceedsUsd.toFixed(2)} USD)`,
+              email_message: `Proceeds from selling ${qty} ${sellResult.symbol} on ${ex}.`,
+            },
+            items: [
+              {
+                recipient_type: "EMAIL",
+                amount: { value: netProceedsUsd.toFixed(2), currency: "USD" },
+                receiver,
+                note: `Crypto-to-Cash: ${qty} ${sellResult.symbol} (${ex})`,
+                sender_item_id: payoutTx.id,
+              },
+            ],
+          },
+          senderBatchId
+        );
+        payoutTx.externalId = out?.batch_header?.payout_batch_id;
+        persist();
+        return res.status(202).json({
+          success: true,
+          processing: true,
+          sellCompleted: true,
+          sellResult,
+          liquidationTransaction: liqTx,
+          payoutTransaction: payoutTx,
+          account: accountPayload(),
+          message: `Sold ${qty} ${sellResult.symbol} on ${ex} for $${netProceedsUsd.toFixed(2)} net USD and initiated PayPal payout to ${maskEmail(receiver)}.`,
+        });
+      } catch (err: any) {
+        if (err.ambiguous) {
+          return res.status(202).json({
+            success: true,
+            processing: true,
+            unknownOutcome: true,
+            sellCompleted: true,
+            sellResult,
+            liquidationTransaction: liqTx,
+            payoutTransaction: payoutTx,
+            account: accountPayload(),
+            message: `Sold ${qty} ${sellResult.symbol} for $${netProceedsUsd.toFixed(2)} USD, but PayPal response timed out. Funds remain reserved until PayPal confirms.`,
+          });
+        }
+        // PayPal definitively rejected payout: return liquidated USD proceeds safely to availableBalance
+        refundWithdrawal(payoutTx);
+        return res.status(err.status || 400).json({
+          success: false,
+          sellCompleted: true,
+          sellResult,
+          liquidationTransaction: liqTx,
+          payoutTransaction: payoutTx,
+          account: accountPayload(),
+          error: `Crypto sold for $${netProceedsUsd.toFixed(2)} USD (safely in USD Ledger), but PayPal payout failed: ${err.message}`,
+          code: err.paypal?.name,
+          paypal: err.paypal || null,
+        });
+      }
+    } catch (err: any) {
+      return res.status(err?.status || 500).json({
+        success: false,
+        error: err?.message || "Crypto-to-Cash liquidation failed.",
+        requiresCredentials: Boolean(err?.requiresCredentials),
+      });
+    }
+  });
+
+  // 9. Rails with no real clearing processor return 501 (live money only; no simulated deposits or payouts) -----
   app.post("/api/fiat/withdraw", (_req, res) =>
     res.status(501).json(NOT_AVAILABLE("Fiat withdrawal", "Paying out to a bank or card needs a payout provider (e.g. Stripe Connect). PayPal payouts are available at POST /api/fiat/withdraw/paypal.")));
   app.post("/api/fiat/link-card", (_req, res) =>

@@ -12,8 +12,9 @@ import { BacktestLabModal } from './components/BacktestLabModal';
 import { ExchangeManagerModal } from './components/ExchangeManagerModal';
 import { LiveCurrencyAccountModal, TabType } from './components/LiveCurrencyAccountModal';
 import { LiveCurrencyTreasuryCard } from './components/LiveCurrencyTreasuryCard';
-import { STRATEGY_PRESETS } from './data/marketData';
-import { DEFAULT_EXCHANGES } from './data/exchangeData';
+import type { PositionLiquidatedSummary } from './components/CryptoToCashTab';
+import { STRATEGY_PRESETS } from './config/strategyPresets';
+import { DEFAULT_EXCHANGES } from './config/exchanges';
 import {
   CryptoAsset,
   Candle,
@@ -147,6 +148,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTC/USDT');
   const [exchanges, setExchanges] = useState<ExchangeConfig[]>(DEFAULT_EXCHANGES);
   const [exchangeModalOpen, setExchangeModalOpen] = useState<boolean>(false);
+  const [exchangeModalInitialTab, setExchangeModalInitialTab] = useState<'WALLETS' | 'ROUTING' | 'HEALTH_CHECK' | 'VAULT_TRANSFER'>('WALLETS');
+  const [exchangeModalDefaultExchange, setExchangeModalDefaultExchange] = useState<ExchangeId>('KRAKEN');
 
   // Live Trading Execution Mode & API Credentials State
   const tradingMode: TradingExecutionMode = 'LIVE_REAL_TRADING'; // live only
@@ -251,6 +254,15 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
     setFiatModalOpen(true);
   };
 
+  const handleOpenExchangeModal = (
+    tab: 'WALLETS' | 'ROUTING' | 'HEALTH_CHECK' | 'VAULT_TRANSFER' = 'WALLETS',
+    defaultExchange: ExchangeId = 'KRAKEN'
+  ) => {
+    setExchangeModalInitialTab(tab);
+    setExchangeModalDefaultExchange(defaultExchange);
+    setExchangeModalOpen(true);
+  };
+
   // Synchronize Live Currency Account from Backend API on mount
   useEffect(() => {
     fetchFiatAccount()
@@ -311,6 +323,98 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         amountDelta > 0 ? 'from Bank / Check Card to Fund Bot' : 'to Fiat Vault'
       }. New Bot Margin: $${(portfolio.cash + amountDelta).toFixed(2)} USD.`,
     ]);
+  };
+
+  // Update trading books when a spot position is liquidated directly to PayPal via Crypto-to-Cash
+  // Note: proceeds exit to PayPal / USD Ledger (handled by server), so do NOT add returnedCapital back to portfolio.cash.
+  const handlePositionLiquidated = (summary: PositionLiquidatedSummary) => {
+    const pos = positionsRef.current.find((p) => p.id === summary.positionId);
+    const now = Date.now();
+    if (!pos) {
+      logBot(`💸 CRYPTO-TO-CASH LIQUIDATION ACCEPTED: Sold ${summary.soldQuantity} ${summary.symbol} on ${summary.exchangeName} for $${summary.netUsd.toFixed(2)} net USD.`);
+      return;
+    }
+
+    const soldQty = Math.min(pos.amount, Math.max(0, summary.soldQuantity));
+    const ratio = pos.amount > 0 ? Math.min(1, soldQty / pos.amount) : 1;
+    const isFullClose = soldQty >= pos.amount * 0.999999;
+
+    const grossPnl = soldQty * (summary.unitPriceUsd - pos.entryPrice) * pos.leverage;
+    const netPnl = grossPnl - summary.feeUsd;
+    const allocatedMarginSold = pos.margin * ratio;
+    const pnlPct = allocatedMarginSold > 0 ? (netPnl / allocatedMarginSold) * 100 : 0;
+    const isWin = netPnl > 0;
+
+    if (netPnl < 0) {
+      const nextLoss = dailyLossRef.current + Math.abs(netPnl);
+      dailyLossRef.current = nextLoss;
+      setDailyLossUsd(nextLoss);
+      if (strategy.dailyLossLimitUsd && nextLoss >= strategy.dailyLossLimitUsd) {
+        setStrategy((st) => ({ ...st, circuitBreakerActive: true }));
+        setBotRunning(false);
+        logBot(`⛔ [CIRCUIT BREAKER TRIGGERED] Cumulative daily loss reached $${nextLoss.toFixed(2)} (Cap: $${strategy.dailyLossLimitUsd}). Automated trading halted to protect capital.`);
+      }
+    }
+
+    setPortfolio((p) => ({
+      ...p,
+      realizedPnl: p.realizedPnl + netPnl,
+      totalTrades: p.totalTrades + 1,
+      winningTrades: p.winningTrades + (isWin ? 1 : 0),
+      losingTrades: p.losingTrades + (isWin ? 0 : 1),
+    }));
+
+    const liqOrder: Order = {
+      id: `ord-ctc-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: now,
+      symbol: pos.symbol,
+      side: 'SELL',
+      type: 'MANUAL_CLOSE',
+      price: summary.unitPriceUsd,
+      amount: soldQty,
+      notional: summary.grossUsd,
+      fee: summary.feeUsd,
+      exchange: summary.exchange,
+      exchangeName: summary.exchangeName,
+      pnl: netPnl,
+      pnlPercent: pnlPct,
+      reason: `Crypto-to-Cash PayPal Payout via ${summary.exchangeName}${summary.orderId ? ` (${summary.orderId})` : ''}`,
+    };
+    setOrders((prev) => [liqOrder, ...prev]);
+
+    setPositions((cur) => {
+      if (isFullClose) {
+        return cur.filter((p) => p.id !== pos.id);
+      }
+      const remainingFactor = Math.max(0, 1 - ratio);
+      return cur.map((p) =>
+        p.id === pos.id
+          ? {
+              ...p,
+              amount: Number((p.amount - soldQty).toFixed(8)),
+              margin: Number((p.margin * remainingFactor).toFixed(2)),
+              notional: Number((p.notional * remainingFactor).toFixed(2)),
+              unrealizedPnl: Number((p.unrealizedPnl * remainingFactor).toFixed(2)),
+            }
+          : p
+      );
+    });
+
+    if (firebaseUser?.uid) {
+      persistExecutionLog(firebaseUser.uid, {
+        id: liqOrder.id,
+        timestamp: liqOrder.timestamp,
+        symbol: liqOrder.symbol,
+        type: liqOrder.side,
+        netProfitUsd: netPnl,
+        status: 'COMPLETED',
+        route: `Crypto-to-Cash (${summary.exchangeName} -> PayPal)`,
+      }).catch(() => {});
+    }
+
+    logBot(
+      `💸 CRYPTO-TO-CASH LIQUIDATION: Sold ${soldQty.toFixed(6)} ${pos.symbol} on ${summary.exchangeName} ($${summary.netUsd.toFixed(2)} net USD -> PayPal Payout; est. realized PnL ${formatCurrency(netPnl)}).`
+    );
   };
 
   // Synchronize Live Portfolio Snapshot from Cloud Firestore upon Firebase Authentication
@@ -1932,6 +2036,7 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
             }}
             availableAssets={assets}
             onOpenCakeWallet={() => setCakeWalletModalOpen(true)}
+            onOpenVaultTransfer={() => handleOpenExchangeModal('VAULT_TRANSFER', 'KRAKEN')}
             onArbitrageExecuted={handleFlashArbExecuted}
           />
         </main>
@@ -1957,10 +2062,11 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         <LiveCurrencyTreasuryCard
           fiatAccount={fiatAccount}
           onOpenModal={() => handleOpenFiatModal('FUND_BOT')}
-          onOpenDebitLoad={() => handleOpenFiatModal('ADD_CARD')}
+          onOpenDebitLoad={() => handleOpenFiatModal('DEBIT_CARD')}
           onOpenBankConnect={() => handleOpenFiatModal('ADD_BANK')}
           onOpenWithdraw={() => handleOpenFiatModal('WITHDRAW')}
-          onOpenFundBot={(method) => handleOpenFiatModal(method === 'CARD' ? 'ADD_CARD' : 'ADD_BANK')}
+          onOpenCryptoToCash={() => handleOpenFiatModal('CRYPTO_TO_CASH')}
+          onOpenFundBot={(method) => handleOpenFiatModal(method === 'CARD' ? 'FUND_BOT' : 'ADD_BANK')}
           onOpenCashCheck={() => handleOpenFiatModal('CASH_CHECK')}
           onOpenSecurity={() => handleOpenFiatModal('SECURITY')}
         />
@@ -2071,7 +2177,6 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
                   currentDailyLossUsd={dailyLossUsd}
                   onResetCircuitBreaker={handleResetCircuitBreaker}
                   activePositionsCount={positions.length}
-                  onQuickFundMargin={() => handleBotCashAdjusted(1000)}
                 />
               </div>
             </div>
@@ -2099,6 +2204,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         tradingMode={tradingMode}
         credentialsSummary={credentialsSummary}
         onRefreshCredentials={fetchCredentialsStatus}
+        initialTab={exchangeModalInitialTab}
+        defaultVaultExchange={exchangeModalDefaultExchange}
       />
 
 
@@ -2122,8 +2229,11 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
         onClose={() => setFiatModalOpen(false)}
         fiatAccount={fiatAccount}
         transactions={fiatTransactions}
+        positions={positions}
+        assets={assets}
         onAccountUpdated={handleAccountUpdated}
         onBotCashAdjusted={handleBotCashAdjusted}
+        onPositionLiquidated={handlePositionLiquidated}
         botCash={portfolio.cash}
         initialTab={fiatModalInitialTab}
       />

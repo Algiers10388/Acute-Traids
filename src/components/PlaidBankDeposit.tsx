@@ -208,8 +208,10 @@ export const PlaidBankDeposit: React.FC<Props> = ({ linkedBanks, onAccountUpdate
     }
   };
 
+  const [confirmingUnlinkId, setConfirmingUnlinkId] = useState<string | null>(null);
+
   const unlink = async (bank: LinkedBankAccount) => {
-    if (!window.confirm(`Unlink ${bank.bankName} ${bank.accountNumberMasked}? Future deposits from it will need a new link.`)) return;
+    setConfirmingUnlinkId(null);
     setError(null);
     const { status, data } = await api('DELETE', `/api/fiat/bank/${encodeURIComponent(bank.id)}`);
     if (!data?.success) return fail(data?.error || `Could not unlink (HTTP ${status}).`);
@@ -277,17 +279,36 @@ export const PlaidBankDeposit: React.FC<Props> = ({ linkedBanks, onAccountUpdate
                   <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-300">
                     <CheckCircle2 className="h-3 w-3" /> Verified by Plaid
                   </span>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      unlink(b);
-                    }}
-                    className="p-1.5 rounded-lg text-slate-400 hover:text-rose-300 hover:bg-rose-950/40 cursor-pointer"
-                    title="Unlink"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
+                  {confirmingUnlinkId === b.id ? (
+                    <div className="flex items-center gap-1" onClick={(e) => e.preventDefault()}>
+                      <button
+                        type="button"
+                        onClick={() => unlink(b)}
+                        className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-bold cursor-pointer"
+                      >
+                        Unlink
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmingUnlinkId(null)}
+                        className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        setConfirmingUnlinkId(b.id);
+                      }}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-rose-300 hover:bg-rose-950/40 cursor-pointer"
+                      title="Unlink"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  )}
                 </div>
               </label>
             ))}

@@ -34,7 +34,7 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { StrategyParameters, TechnicalIndicators, TriggerType, CryptoAsset } from '../types';
-import { STRATEGY_PRESETS } from '../data/marketData';
+import { STRATEGY_PRESETS } from '../config/strategyPresets';
 import { formatPercent, formatCurrency, calculateDynamicPositionSize, calculateSmartTrailingPercent } from '../utils/cryptoMath';
 
 interface StrategyBotControllerProps {
@@ -55,7 +55,6 @@ interface StrategyBotControllerProps {
   currentDailyLossUsd?: number;
   onResetCircuitBreaker?: () => void;
   activePositionsCount?: number;
-  onQuickFundMargin?: () => void;
 }
 
 export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
@@ -76,7 +75,6 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
   currentDailyLossUsd = 0,
   onResetCircuitBreaker,
   activePositionsCount = 0,
-  onQuickFundMargin,
 }) => {
   const [showSellDiagnostics, setShowSellDiagnostics] = React.useState(true);
   const [showIndicatorSettings, setShowIndicatorSettings] = React.useState(false);
@@ -166,7 +164,7 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
           <div className="flex items-center gap-2">
             <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0" />
             <span className="text-xs text-amber-200">
-              Bot trading margin is low (<strong>${botCash.toFixed(2)} USD</strong>). Fund the bot from your bank or check card to execute trades.
+              Bot trading margin is low (<strong>${botCash.toFixed(2)} USD</strong>). Fund the bot from your bank or card to execute live trades.
             </span>
           </div>
           {onOpenDepositToBot && (
@@ -185,14 +183,14 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
                 className="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-[11px] font-bold cursor-pointer transition-all flex items-center gap-1"
               >
                 <CreditCard className="h-3 w-3" />
-                <span>+ Check Card</span>
+                <span>+ Card (Stripe)</span>
               </button>
             </div>
           )}
         </div>
       )}
 
-      {/* Bot Capital & Instant Bank / Check Card Quick Bar */}
+      {/* Bot Capital & Bank / Card Quick Bar */}
       {typeof botCash === 'number' && (
         <div className="p-3 bg-slate-950/60 border border-slate-800/90 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
           <div>
@@ -209,25 +207,13 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-            {botCash < 30 && onQuickFundMargin && (
-              <button
-                type="button"
-                onClick={onQuickFundMargin}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold text-xs cursor-pointer shadow-md transition-all shrink-0 animate-pulse"
-                title="1-Click fund $1,000 trading margin to enable automated algorithmic orders"
-              >
-                <Zap className="h-3.5 w-3.5 fill-current" />
-                <span>+ Load $1,000 Margin</span>
-              </button>
-            )}
-
             {onOpenDepositToBot && (
               <>
                 <button
                   type="button"
                   onClick={() => onOpenDepositToBot('BANK')}
                   className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold cursor-pointer transition-all hover:scale-[1.02] shadow-sm"
-                  title="Deposit directly from connected bank into Bot Trading Cash"
+                  title="Deposit from linked bank into USD Ledger via Plaid + Stripe ACH"
                 >
                   <Building2 className="h-3.5 w-3.5 text-emerald-400" />
                   <span>Fund via Bank</span>
@@ -237,10 +223,10 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
                   type="button"
                   onClick={() => onOpenDepositToBot('CARD')}
                   className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-xs font-bold cursor-pointer transition-all hover:scale-[1.02] shadow-sm"
-                  title="Deposit directly from check or debit card into Bot Trading Cash"
+                  title="Deposit directly via Stripe Card into Bot Trading Cash"
                 >
                   <CreditCard className="h-3.5 w-3.5 text-cyan-400" />
-                  <span>Fund via Check Card</span>
+                  <span>Fund via Card</span>
                 </button>
               </>
             )}
@@ -1672,17 +1658,6 @@ export const StrategyBotController: React.FC<StrategyBotControllerProps> = ({
               </div>
 
               <div className="flex items-center gap-2">
-                {typeof botCash === 'number' && botCash < 50 && onQuickFundMargin && (
-                  <button
-                    type="button"
-                    onClick={onQuickFundMargin}
-                    className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5"
-                  >
-                    <Wallet className="h-3.5 w-3.5 text-cyan-400" />
-                    <span>Quick Fund $1,000 Margin</span>
-                  </button>
-                )}
-
                 <button
                   type="button"
                   onClick={() => onManualOrder('SELL')}

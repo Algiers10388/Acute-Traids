@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseSweepDirection, resolveSweepPipelineEndpoints } from './sweepPipeline.ts';
 
-const PROFIT_WALLET = '0xD5503C876a5DFeE057727cfacb6a59E8C7554f5b';
+const PROFIT_WALLET = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
 const GAS_WALLET = '0xF1d765d693f9e6fAb0c4a2FCa942d9D54233C966';
 const CONNECTED_WALLET = '0x1111111111111111111111111111111111111111';
 

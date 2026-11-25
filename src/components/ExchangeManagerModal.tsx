@@ -20,6 +20,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Sliders,
+  Vault,
   Wallet,
   Wifi,
   X,
@@ -44,6 +45,7 @@ import {
   fetchExchangeHealthCheck,
 } from '../services/exchangeApi';
 import { ReceivePrivacyCoinModal } from './ReceivePrivacyCoinModal';
+import { VaultToExchangeTransfer } from './VaultToExchangeTransfer';
 
 interface ExchangeManagerModalProps {
   isOpen: boolean;
@@ -54,6 +56,8 @@ interface ExchangeManagerModalProps {
   tradingMode: TradingExecutionMode;
   credentialsSummary: CredentialsSummary | null;
   onRefreshCredentials: () => void;
+  initialTab?: 'WALLETS' | 'ROUTING' | 'HEALTH_CHECK' | 'VAULT_TRANSFER';
+  defaultVaultExchange?: ExchangeId;
 }
 
 export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
@@ -65,8 +69,11 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
   tradingMode,
   credentialsSummary,
   onRefreshCredentials,
+  initialTab,
+  defaultVaultExchange,
 }) => {
-  const [activeTab, setActiveTab] = useState<'WALLETS' | 'ROUTING' | 'HEALTH_CHECK'>('WALLETS');
+  const [activeTab, setActiveTab] = useState<'WALLETS' | 'ROUTING' | 'HEALTH_CHECK' | 'VAULT_TRANSFER'>(initialTab || 'WALLETS');
+  const [vaultExchangeTarget, setVaultExchangeTarget] = useState<ExchangeId>(defaultVaultExchange || 'KRAKEN');
   const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
   const [isPinging, setIsPinging] = useState(false);
   const [pingSuccess, setPingSuccess] = useState(false);
@@ -109,11 +116,13 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
+      if (initialTab) setActiveTab(initialTab);
+      if (defaultVaultExchange) setVaultExchangeTarget(defaultVaultExchange);
       loadWallets();
       loadTransactions();
       loadHealthCheck();
     }
-  }, [isOpen]);
+  }, [isOpen, initialTab, defaultVaultExchange]);
 
   const loadHealthCheck = async () => {
     try {
@@ -465,6 +474,18 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
             </button>
 
             <button
+              onClick={() => setActiveTab('VAULT_TRANSFER')}
+              className={`py-3 px-4 font-mono text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-2 ${
+                activeTab === 'VAULT_TRANSFER'
+                  ? 'border-emerald-400 text-emerald-300'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Vault className="h-3.5 w-3.5 text-emerald-400" />
+              <span>Vault → Kraken / CEX</span>
+            </button>
+
+            <button
               onClick={() => setActiveTab('ROUTING')}
               className={`py-3 px-4 font-mono text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-2 ${
                 activeTab === 'ROUTING'
@@ -720,6 +741,18 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
                             </button>
                           )}
                         </div>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setVaultExchangeTarget(card.id);
+                            setActiveTab('VAULT_TRANSFER');
+                          }}
+                          className="w-full py-1.5 px-3 rounded-xl bg-slate-900 hover:bg-cyan-500/15 border border-slate-800 hover:border-cyan-500/40 text-cyan-300 font-mono font-bold text-[11px] transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Vault className="h-3.5 w-3.5 text-emerald-400" />
+                          <span>Deposit from Profit Vault → {card.id}</span>
+                        </button>
                       </div>
                     </div>
                   );
@@ -1245,6 +1278,16 @@ export const ExchangeManagerModal: React.FC<ExchangeManagerModalProps> = ({
                 })}
               </div>
             </div>
+          )}
+
+          {activeTab === 'VAULT_TRANSFER' && (
+            <VaultToExchangeTransfer
+              defaultExchange={vaultExchangeTarget}
+              onTransferComplete={() => {
+                loadTransactions();
+                loadWallets();
+              }}
+            />
           )}
 
           {/* Security Architecture Box */}

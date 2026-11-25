@@ -6,7 +6,7 @@ import {
   ArbitrageOpportunity,
   ExecutionRoutingMode,
 } from '../types';
-import { DEFAULT_EXCHANGES } from '../data/exchangeData';
+import { DEFAULT_EXCHANGES } from '../config/exchanges';
 
 /**
  * Convert standard symbol (e.g. BTC/USDT) to NonKYC ticker symbol format (e.g. BTC_USDT)

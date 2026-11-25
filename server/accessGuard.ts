@@ -22,6 +22,30 @@ export function tokenMatches(sent: string, expected: string): boolean {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function firstHeaderValue(val: unknown): string {
+  return String(val || '').split(',')[0].trim().toLowerCase();
+}
+
+export function sameOriginMatchesHost(headers: Record<string, any> = {}): boolean {
+  const originRaw = String(headers.origin || '').trim();
+  if (!originRaw) return false;
+  let originUrl: URL;
+  try {
+    originUrl = new URL(originRaw);
+  } catch {
+    return false;
+  }
+  if (originUrl.protocol !== 'http:' && originUrl.protocol !== 'https:') return false;
+
+  const expectedHost = firstHeaderValue(headers['x-forwarded-host']) || firstHeaderValue(headers.host);
+  if (!expectedHost) return false;
+  if (originUrl.host.toLowerCase() !== expectedHost) return false;
+
+  const forwardedProto = firstHeaderValue(headers['x-forwarded-proto']);
+  if (forwardedProto && originUrl.protocol !== `${forwardedProto}:`) return false;
+  return true;
+}
+
 export function createAccessGuard(opts: { token?: string; openPaths?: RegExp[]; env?: Record<string, string | undefined> } = {}) {
   const token = opts.token ?? '';
   const open = opts.openPaths ?? OPEN_API_PATHS;
@@ -34,7 +58,11 @@ export function createAccessGuard(opts: { token?: string; openPaths?: RegExp[]; 
     if (LOOPBACK.has(req.socket?.remoteAddress) && !proxied) return next();
     if (tokenMatches(String(req.headers?.['x-api-token'] || ''), token)) return next();
     // Same-origin browser requests originating from the app's own web UI
-    if (req.headers?.['sec-fetch-site'] === 'same-origin') return next();
+    const secFetchSite = String(req.headers?.['sec-fetch-site'] || '').toLowerCase();
+    if (secFetchSite === 'same-origin') return next();
+    // Some WebViews/mobile browsers omit sec-fetch-site behind proxies: allow only if Origin strictly matches Host / X-Forwarded-Host
+    if (!secFetchSite && sameOriginMatchesHost(req.headers)) return next();
     return res.status(403).json({ success: false, error: 'Forbidden: local requests only (or send x-api-token matching API_ACCESS_TOKEN).' });
   };
 }
+

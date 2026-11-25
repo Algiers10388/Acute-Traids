@@ -13,52 +13,42 @@ import {
   Clock,
   Copy,
   Check,
-  Plus,
   Zap,
   Building2,
-  ExternalLink,
   Receipt,
-  Sparkles,
   RefreshCw,
   Download,
-  SlidersHorizontal,
-  Filter,
   Search,
-  ArrowUpDown,
-  RotateCw,
-  Trash2,
+  FileCheck,
+  Coins,
+  Vault,
 } from 'lucide-react';
 import {
+  CryptoAsset,
   FiatAccount,
   FiatTransaction,
-  LinkedBankAccount,
-  LinkedDebitCard,
-  ThreeDSChallengeSession,
-  ThreeDSVerificationResult,
+  Position,
 } from '../types';
 import {
-  depositViaCard,
-  linkDebitCard,
-  removeBankAccount,
-  removeDebitCard,
+  fiatFetch,
   transferBetweenFiatAndBot,
-  withdrawToBank,
-  withdrawFunds,
-  initiate3DsChallenge,
 } from '../services/fiatApi';
 import { formatCurrency } from '../utils/cryptoMath';
 import { CashCheckModalTab } from './CashCheckModalTab';
 import { BankBotSecurityTab } from './BankBotSecurityTab';
-import { ThreeDSecureModal } from './ThreeDSecureModal';
 import { StripeCardDeposit, type StripeDepositResult } from './StripeCardDeposit';
 import { PlaidBankDeposit } from './PlaidBankDeposit';
 import { PayPalWithdraw } from './PayPalWithdraw';
+import { CryptoToCashTab, type PositionLiquidatedSummary } from './CryptoToCashTab';
+import { VaultToExchangeTransfer } from './VaultToExchangeTransfer';
 
 export type TabType =
   | 'FUND_BOT'
   | 'CASH_CHECK'
   | 'SECURITY'
   | 'WITHDRAW'
+  | 'CRYPTO_TO_CASH'
+  | 'VAULT_TRANSFER'
   | 'ADD_BANK'
   | 'ADD_CARD'
   | 'DEPOSIT'
@@ -72,38 +62,25 @@ interface LiveCurrencyAccountModalProps {
   onClose: () => void;
   fiatAccount: FiatAccount;
   transactions: FiatTransaction[];
+  positions?: Position[];
+  assets?: CryptoAsset[];
   onAccountUpdated: (newAccount: FiatAccount, notificationMsg?: string) => void;
   onBotCashAdjusted?: (amountDelta: number) => void;
+  onPositionLiquidated?: (summary: PositionLiquidatedSummary) => void;
   botCash: number;
   initialTab?: TabType;
 }
-
-const POPULAR_BANKS = [
-  { name: 'Bank of America', routing: '121000358' },
-  { name: 'Wells Fargo', routing: '121000248' },
-  { name: 'Citibank', routing: '021000089' },
-  { name: 'Capital One', routing: '051405515' },
-  { name: 'Charles Schwab Bank', routing: '121143720' },
-  { name: 'Fidelity Cash Mgmt', routing: '101205681' },
-  { name: 'Navy Federal CU', routing: '256074974' },
-  { name: 'US Bank', routing: '091000022' },
-  { name: 'PNC Bank', routing: '043000096' },
-  { name: 'TD Bank', routing: '031201360' },
-  { name: 'Ally Bank', routing: '124085066' },
-  { name: 'Discover Bank', routing: '031100649' },
-  { name: 'Truist Bank', routing: '061000104' },
-  { name: 'Huntington Bank', routing: '044000024' },
-  { name: 'JPMorgan Chase', routing: '021000021' },
-  { name: 'Goldman Sachs Marcus', routing: '021000089' },
-];
 
 export const LiveCurrencyAccountModal: React.FC<LiveCurrencyAccountModalProps> = ({
   isOpen,
   onClose,
   fiatAccount,
   transactions,
+  positions = [],
+  assets = [],
   onAccountUpdated,
   onBotCashAdjusted,
+  onPositionLiquidated,
   botCash,
   initialTab,
 }) => {
@@ -113,41 +90,58 @@ export const LiveCurrencyAccountModal: React.FC<LiveCurrencyAccountModalProps> =
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
 
   // Dedicated Tab: Fund Trading Bot State
-  const [fundBotSourceType, setFundBotSourceType] = useState<'BANK' | 'CARD' | 'VAULT'>('BANK');
+  const [fundBotSourceType, setFundBotSourceType] = useState<'BANK' | 'CARD' | 'VAULT'>('CARD');
   const [fundBotAmount, setFundBotAmount] = useState<string>('500');
   const [fundSuccessReceipt, setFundSuccessReceipt] = useState<FiatTransaction | null>(null);
-  const [showNewBankInFund, setShowNewBankInFund] = useState<boolean>(false);
-  const [showNewCardInFund, setShowNewCardInFund] = useState<boolean>(false);
 
-  // Sub-toggle for deposit method: defaults to BANK
-  const [depositMethod, setDepositMethod] = useState<'CARD' | 'BANK'>('BANK');
-  // Target destination for deposits: directly fund bot cash or store in live vault
+  // Sub-toggle for deposit method
+  const [depositMethod, setDepositMethod] = useState<'CARD' | 'BANK'>('CARD');
+  // Target destination for deposits: directly fund bot cash or store in live USD ledger
   const [depositTarget, setDepositTarget] = useState<'BOT' | 'VAULT'>('BOT');
 
-  // Interactive UI State enhancements
-  const [isCardFlipped, setIsCardFlipped] = useState<boolean>(false);
-  const [bankSearchQuery, setBankSearchQuery] = useState<string>('');
+  // Interactive ledger filters
   const [ledgerFilter, setLedgerFilter] = useState<'ALL' | 'WITHDRAW' | 'DEPOSIT' | 'BOT_TRANSFER'>('ALL');
   const [ledgerSearch, setLedgerSearch] = useState<string>('');
 
-  // 3D Secure 2.2 Strong Customer Authentication State
-  const [active3DsSession, setActive3DsSession] = useState<ThreeDSChallengeSession | null>(null);
-  const [suggested3DsOtp, setSuggested3DsOtp] = useState<string | undefined>(undefined);
-  const [is3DsModalOpen, setIs3DsModalOpen] = useState<boolean>(false);
+  // Card deposit amount
+  const [cardDepositAmount, setCardDepositAmount] = useState<string>('');
+
+  // Tab: Bot Transfer State
+  const [botTransferDirection, setBotTransferDirection] = useState<'TO_BOT' | 'FROM_BOT'>('TO_BOT');
+  const [botTransferAmount, setBotTransferAmount] = useState<string>('100');
+  const [transfer2FaNeeded, setTransfer2FaNeeded] = useState<boolean>(false);
+  const [transfer2FaCode, setTransfer2FaCode] = useState<string>('');
+  const [checkRailInfo, setCheckRailInfo] = useState<{ active: boolean; env?: string | null }>({ active: false });
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+    fiatFetch('/api/fiat/config')
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (!cancelled && cfg?.rails) {
+          setCheckRailInfo({ active: Boolean(cfg.rails.check), env: cfg.rails.increase?.env ?? null });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
 
   useEffect(() => {
     if (initialTab && isOpen) {
       if (initialTab === 'FUND_BOT') {
         setActiveTab('FUND_BOT');
         setDepositTarget('BOT');
-      } else if (initialTab === 'DEBIT_CARD') {
-        setActiveTab('FUND_BOT');
-        setFundBotSourceType('CARD');
+      } else if (initialTab === 'DEBIT_CARD' || initialTab === 'ADD_CARD') {
+        setActiveTab('DEPOSIT');
+        setDepositMethod('CARD');
         setDepositTarget('BOT');
       } else if (initialTab === 'BANK_TRANSFER') {
-        setActiveTab('FUND_BOT');
-        setFundBotSourceType('BANK');
-        setDepositTarget('BOT');
+        setActiveTab('DEPOSIT');
+        setDepositMethod('BANK');
+        setDepositTarget('VAULT');
       } else {
         setActiveTab(initialTab);
       }
@@ -157,93 +151,27 @@ export const LiveCurrencyAccountModal: React.FC<LiveCurrencyAccountModalProps> =
     }
   }, [initialTab, isOpen]);
 
-  // Tab: Debit Card State
-  const [selectedCardId, setSelectedCardId] = useState<string>(fiatAccount.linkedCards[0]?.id || 'NEW');
-  const [cardDepositAmount, setCardDepositAmount] = useState<string>('');
-  const [newCardNumber, setNewCardNumber] = useState<string>('');
-  const [newCardExpMonth, setNewCardExpMonth] = useState<string>('12');
-  const [newCardExpYear, setNewCardExpYear] = useState<string>('2029');
-  const [newCardCvc, setNewCardCvc] = useState<string>('');
-  const [newCardHolder, setNewCardHolder] = useState<string>(fiatAccount.accountHolder || 'Authorized Trader');
-  const [saveNewCard, setSaveNewCard] = useState<boolean>(true);
-
-  // Tab: Bank Transfer State
-  const [selectedBankId, setSelectedBankId] = useState<string>(fiatAccount.linkedBanks[0]?.id || '');
-  const [bankDepositAmount, setBankDepositAmount] = useState<string>('');
-  const [transferSpeed, setTransferSpeed] = useState<'INSTANT_FEDNOW' | 'STANDARD_ACH'>('INSTANT_FEDNOW');
-  const [showConnectBankForm, setShowConnectBankForm] = useState<boolean>(false);
-  const [newBankName, setNewBankName] = useState<string>('');
-  const [newRoutingNumber, setNewRoutingNumber] = useState<string>('');
-  const [newAccountNumber, setNewAccountNumber] = useState<string>('');
-  const [newAccountType, setNewAccountType] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
-  const [newAccountHolder, setNewAccountHolder] = useState<string>(fiatAccount.accountHolder || 'Authorized Trader');
-
-  // Tab: Comprehensive Withdraw State
-  const [withdrawSource, setWithdrawSource] = useState<'TREASURY' | 'BOT'>('TREASURY');
-  const [withdrawDestinationType, setWithdrawDestinationType] = useState<'BANK' | 'CARD'>('BANK');
-  const [withdrawBankId, setWithdrawBankId] = useState<string>(fiatAccount.linkedBanks[0]?.id || '');
-  const [withdrawCardId, setWithdrawCardId] = useState<string>(fiatAccount.linkedCards[0]?.id || '');
-  const [withdrawRail, setWithdrawRail] = useState<'INSTANT_FEDNOW' | 'ACH_TRANSFER' | 'SAME_DAY_WIRE'>('INSTANT_FEDNOW');
-  const [withdrawAmount, setWithdrawAmount] = useState<string>('');
-  const [showInlineNewBank, setShowInlineNewBank] = useState<boolean>(false);
-  const [showInlineNewCard, setShowInlineNewCard] = useState<boolean>(false);
-  const [inlineBankName, setInlineBankName] = useState<string>('');
-  const [inlineRouting, setInlineRouting] = useState<string>('');
-  const [inlineAccountNum, setInlineAccountNum] = useState<string>('');
-  const [inlineAccountType, setInlineAccountType] = useState<'CHECKING' | 'SAVINGS'>('CHECKING');
-  const [inlineCardNum, setInlineCardNum] = useState<string>('');
-  const [inlineCardExpMonth, setInlineCardExpMonth] = useState<string>('');
-  const [inlineCardExpYear, setInlineCardExpYear] = useState<string>('');
-  const [inlineCardCvc, setInlineCardCvc] = useState<string>('');
-  const [inlineCardHolder, setInlineCardHolder] = useState<string>(fiatAccount.accountHolder);
-  const [withdraw2FaCode, setWithdraw2FaCode] = useState<string>('');
-  const [withdrawSuccessReceipt, setWithdrawSuccessReceipt] = useState<FiatTransaction | null>(null);
-
-  // Tab: Bot Transfer State
-  const [botTransferDirection, setBotTransferDirection] = useState<'TO_BOT' | 'FROM_BOT'>('TO_BOT');
-  const [botTransferAmount, setBotTransferAmount] = useState<string>('1000');
-
-  useEffect(() => {
-    if (!selectedBankId && fiatAccount.linkedBanks.length > 0) {
-      setSelectedBankId(fiatAccount.linkedBanks[0].id);
-    }
-    if ((!selectedCardId || selectedCardId === 'NEW') && fiatAccount.linkedCards.length > 0) {
-      setSelectedCardId(fiatAccount.linkedCards[0].id);
-    }
-    if ((!withdrawBankId || !fiatAccount.linkedBanks.some((b) => b.id === withdrawBankId)) && fiatAccount.linkedBanks.length > 0) {
-      setWithdrawBankId(fiatAccount.linkedBanks[0].id);
-    }
-    if ((!withdrawCardId || !fiatAccount.linkedCards.some((c) => c.id === withdrawCardId)) && fiatAccount.linkedCards.length > 0) {
-      setWithdrawCardId(fiatAccount.linkedCards[0].id);
-    }
-  }, [fiatAccount.linkedBanks, fiatAccount.linkedCards, selectedBankId, selectedCardId, withdrawBankId, withdrawCardId]);
-
   const downloadReceiptText = (tx: FiatTransaction) => {
     const receiptContent = `========================================================
-ONSET-TRAIDS FINANCIAL RAIL - PROOF OF SETTLEMENT
+USD LEDGER TRANSACTION RECORD
 ========================================================
-Settlement ID:      ${tx.id}
-Cryptographic Hash: ${tx.referenceHash}
+Transaction ID:     ${tx.id}${tx.externalId ? `\nProcessor Ref:      ${tx.externalId}` : ''}
+Reference Hash:     ${tx.referenceHash}
 Timestamp:          ${new Date(tx.timestamp).toISOString()} (${new Date(tx.timestamp).toLocaleString()})
 Transaction Type:   ${tx.type}
-Rail:               ${tx.rail}
+Settlement Rail:    ${tx.rail}
 Source:             ${tx.sourceName}
-Destination:        ${tx.destinationName || 'Linked Custodial Account'}
+Destination:        ${tx.destinationName || 'USD Ledger'}
 Gross Amount:       $${tx.amount.toFixed(2)} USD
-Network Fee:        $${(tx.fee || 0).toFixed(2)} USD (Zero Payout Fee)
-Net Settled:        $${(tx.netAmount || tx.amount).toFixed(2)} USD
-Settlement Status:  COMPLETED / VERIFIED (FDIC Rail)
-Custodial Trust:    Evolve Bank & Trust / Cross River Bank
-Encryption:         AES-256-GCM Hardware Security Module
-========================================================
-Federal Reserve FedNow / Visa Direct Gateway Acknowledged.
-This document certifies real-time clearing across banking rails.
+Processor Fee:      $${(tx.fee || 0).toFixed(2)} USD
+Net Credited/Paid:  $${(tx.netAmount ?? tx.amount).toFixed(2)} USD
+Status:             ${tx.status}
 ========================================================`;
     const blob = new Blob([receiptContent], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Settlement-Receipt-${tx.referenceHash.slice(0, 8)}.txt`;
+    a.download = `Transaction-Record-${tx.referenceHash.slice(0, 8)}.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -265,28 +193,6 @@ This document certifies real-time clearing across banking rails.
     setTimeout(() => setCopiedHash(null), 2000);
   };
 
-  const handle3DsSuccess = (result: ThreeDSVerificationResult) => {
-    setIs3DsModalOpen(false);
-    setActive3DsSession(null);
-    if (result.account) {
-      onAccountUpdated(result.account, result.message);
-    }
-    if (result.transaction) {
-      setFundSuccessReceipt(result.transaction);
-      if (
-        onBotCashAdjusted &&
-        (result.transaction.destinationName?.toLowerCase().includes('bot') ||
-          result.transaction.type === 'TRANSFER_TO_BOT_CAPITAL')
-      ) {
-        onBotCashAdjusted(result.transaction.amount);
-      }
-    }
-    showFeedback(
-      'success',
-      `3D Secure 2.2 Verified! Cryptogram: ${result.cavv.slice(0, 10)}... Issuer liability shift applied.`
-    );
-  };
-
   // Real card deposit finished (Stripe confirmed it and the server credited the ledger)
   const handleStripeDeposited = (result: StripeDepositResult, fallbackAmount: number) => {
     onAccountUpdated(result.account, result.message);
@@ -297,7 +203,7 @@ This document certifies real-time clearing across banking rails.
     showFeedback('success', result.message);
   };
 
-  // Primary: Handle Direct Transfer to Fund Trading Bot
+  // Primary: Handle Direct Transfer from USD Ledger to Trading Bot
   const handleFundBotSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const amt = parseFloat(fundBotAmount);
@@ -309,115 +215,28 @@ This document certifies real-time clearing across banking rails.
     setIsLoading(true);
     try {
       if (fundBotSourceType === 'BANK') {
-        throw new Error('Bank (ACH) deposits go to the USD ledger first. Use the Bank tab, then Transfer to Bot after the funds settle.');
+        throw new Error('Bank (ACH) deposits go to the USD ledger first. Use the Deposit / Bank tab, then Transfer to Bot after the funds settle.');
       } else if (fundBotSourceType === 'CARD') {
-        throw new Error('Use the "Charge card" button inside the card form to pay with Stripe.');
+        throw new Error('Use the "Charge card" button inside the Stripe card form to pay.');
       } else if (fundBotSourceType === 'VAULT') {
         if (amt > fiatAccount.availableBalance) {
-          throw new Error(`Insufficient funds in Live Vault ($${fiatAccount.availableBalance.toFixed(2)} available).`);
+          throw new Error(`Insufficient funds in USD Ledger ($${fiatAccount.availableBalance.toFixed(2)} available).`);
         }
-        const res = await transferBetweenFiatAndBot('TO_BOT', amt);
+        const res = await transferBetweenFiatAndBot('TO_BOT', amt, transfer2FaCode.trim() || undefined);
         onAccountUpdated(res.account, res.message);
         if (onBotCashAdjusted) {
           onBotCashAdjusted(amt);
         }
+        setTransfer2FaNeeded(false);
+        setTransfer2FaCode('');
         setFundSuccessReceipt(res.transaction);
         showFeedback('success', res.message);
       }
     } catch (err: any) {
+      if (err?.requires2FA) {
+        setTransfer2FaNeeded(true);
+      }
       showFeedback('error', err.message || 'Bot funding transfer failed.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 3e. Remove a Linked Bank Account
-  const handleRemoveBank = async (bankId: string, bankName: string) => {
-    setIsLoading(true);
-    try {
-      const res = await removeBankAccount(bankId);
-      onAccountUpdated(res.account, res.message);
-      if (selectedBankId === bankId) {
-        setSelectedBankId(res.account.linkedBanks[0]?.id || '');
-      }
-      if (withdrawBankId === bankId) {
-        setWithdrawBankId(res.account.linkedBanks[0]?.id || '');
-      }
-      showFeedback('success', res.message || `Disconnected ${bankName}.`);
-    } catch (err: any) {
-      showFeedback('error', err.message || 'Failed to remove bank account.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 3f. Remove a Linked Debit Card
-  const handleRemoveCard = async (cardId: string, brand: string, last4: string) => {
-    setIsLoading(true);
-    try {
-      const res = await removeDebitCard(cardId);
-      onAccountUpdated(res.account, res.message);
-      if (selectedCardId === cardId) {
-        setSelectedCardId(res.account.linkedCards[0]?.id || 'NEW');
-      }
-      if (withdrawCardId === cardId) {
-        setWithdrawCardId(res.account.linkedCards[0]?.id || '');
-      }
-      showFeedback('success', res.message || `Disconnected ${brand} •••• ${last4}.`);
-    } catch (err: any) {
-      showFeedback('error', err.message || 'Failed to remove debit card.');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // 4. Handle Withdrawal
-  const handleWithdrawal = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const amt = parseFloat(withdrawAmount);
-    if (isNaN(amt) || amt < 0.01) {
-      showFeedback('error', 'Minimum withdrawal amount is $0.01 USD.');
-      return;
-    }
-
-    const availableLimit = withdrawSource === 'TREASURY' ? fiatAccount.availableBalance : botCash;
-    if (amt > availableLimit) {
-      showFeedback(
-        'error',
-        `Insufficient funds in ${withdrawSource === 'TREASURY' ? 'Live Vault Cash' : 'Trading Bot Cash'}. Available: $${availableLimit.toFixed(2)}`
-      );
-      return;
-    }
-
-    let newDest: any = undefined;
-
-    if (withdrawDestinationType === 'CARD' && !showInlineNewCard && !withdrawCardId && fiatAccount.linkedCards.length === 0) {
-      setShowInlineNewCard(true);
-      showFeedback('error', 'Please enter your check/debit card details to complete the payout.');
-      return;
-    }
-
-    setIsLoading(true);
-    try {
-      const res = await withdrawFunds({
-        destinationType: withdrawDestinationType,
-        bankId: withdrawDestinationType === 'BANK' ? withdrawBankId : undefined,
-        cardId: withdrawDestinationType === 'CARD' ? withdrawCardId : undefined,
-        amount: amt,
-        rail: withdrawDestinationType === 'CARD' ? 'VISA_DIRECT_PUSH' : withdrawRail,
-        source: withdrawSource,
-        newDestination: newDest,
-        twoFactorCode: withdraw2FaCode.trim() || undefined,
-      });
-
-      onAccountUpdated(res.account, res.message);
-      if (withdrawSource === 'BOT' && onBotCashAdjusted) {
-        onBotCashAdjusted(-amt);
-      }
-      setWithdrawSuccessReceipt(res.transaction);
-      showFeedback('success', res.message);
-    } catch (err: any) {
-      showFeedback('error', err.message || 'Withdrawal processing failed.');
     } finally {
       setIsLoading(false);
     }
@@ -439,21 +258,23 @@ This document certifies real-time clearing across banking rails.
 
     setIsLoading(true);
     try {
-      const res = await transferBetweenFiatAndBot(botTransferDirection, amt);
+      const res = await transferBetweenFiatAndBot(botTransferDirection, amt, transfer2FaCode.trim() || undefined);
       onAccountUpdated(res.account, res.message);
       if (onBotCashAdjusted) {
         onBotCashAdjusted(botTransferDirection === 'TO_BOT' ? amt : -amt);
       }
+      setTransfer2FaNeeded(false);
+      setTransfer2FaCode('');
       showFeedback('success', res.message);
     } catch (err: any) {
+      if (err?.requires2FA) {
+        setTransfer2FaNeeded(true);
+      }
       showFeedback('error', err.message || 'Capital transfer failed.');
     } finally {
       setIsLoading(false);
     }
   };
-
-  // Helper for card preview
-  const activeCard = fiatAccount.linkedCards.find((c) => c.id === selectedCardId);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 overflow-y-auto">
@@ -465,18 +286,22 @@ This document certifies real-time clearing across banking rails.
               <Landmark className="h-5 w-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="text-base font-bold text-white tracking-tight">Live Currency Account & Banking Rail</h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold font-mono uppercase bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                  <ShieldCheck className="h-3 w-3 text-emerald-400" />
-                  AES-256 GCM Vault
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold font-mono uppercase flex items-center gap-1 border ${
+                  fiatAccount.twoFactorEnabled
+                    ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                    : 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                }`}>
+                  <ShieldCheck className="h-3 w-3" />
+                  {fiatAccount.twoFactorEnabled ? '2FA Active' : '2FA Setup Needed'}
                 </span>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/30">
-                  FDIC Custody
+                  Live Stripe & PayPal
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Multi-currency fiat treasury with instant debit card loading, multi-rail withdrawals, and direct connectivity to any US bank.
+                Live USD ledger with Stripe card deposits, Plaid + Stripe ACH bank linking, and PayPal payouts.
               </p>
             </div>
           </div>
@@ -495,7 +320,11 @@ This document certifies real-time clearing across banking rails.
             <div className="text-xl font-black text-emerald-400 font-mono mt-0.5">
               {formatCurrency(fiatAccount.availableBalance)}
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Instant Clearing (USD)</div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {fiatAccount.pendingBalance > 0
+                ? <span className="text-amber-300 font-mono">Pending: {formatCurrency(fiatAccount.pendingBalance)}</span>
+                : 'USD Ledger (Settled)'}
+            </div>
           </div>
 
           <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
@@ -509,17 +338,17 @@ This document certifies real-time clearing across banking rails.
           <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Connected Banks</div>
             <div className="text-xl font-black text-white font-mono mt-0.5">
-              {fiatAccount.linkedBanks.length} <span className="text-xs font-normal text-slate-400">Institutions</span>
+              {fiatAccount.linkedBanks.length} <span className="text-xs font-normal text-slate-400">Linked</span>
             </div>
             <div className="text-[10px] text-emerald-400/80 mt-0.5 flex items-center gap-1">
-              <CheckCircle2 className="h-2.5 w-2.5" /> ACH & FedNow Verified
+              <CheckCircle2 className="h-2.5 w-2.5" /> {fiatAccount.linkedBanks.length > 0 ? 'Plaid + Stripe ACH' : 'No bank linked'}
             </div>
           </div>
 
           <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Daily Limit Remaining</div>
             <div className="text-xl font-black text-slate-200 font-mono mt-0.5">
-              ${(fiatAccount.dailyDepositLimit - fiatAccount.dailyDepositUsed).toLocaleString()}
+              ${Math.max(0, fiatAccount.dailyDepositLimit - fiatAccount.dailyDepositUsed).toLocaleString()}
             </div>
             <div className="text-[10px] text-slate-500 mt-0.5">Limit: ${fiatAccount.dailyDepositLimit.toLocaleString()}/day</div>
           </div>
@@ -543,7 +372,7 @@ This document certifies real-time clearing across banking rails.
           </div>
         )}
 
-        {/* Navigation Tabs - Primary Fund Trading Bot along with banking operations */}
+        {/* Navigation Tabs */}
         <div className="flex border-b border-slate-800 px-6 bg-slate-950/70 overflow-x-auto text-xs font-semibold gap-2 py-3 scrollbar-thin">
           <button
             type="button"
@@ -555,9 +384,9 @@ This document certifies real-time clearing across banking rails.
             }`}
           >
             <Zap className="h-4 w-4 text-amber-400" />
-            <span className="text-xs">⚡ Fund Trading Bot</span>
+            <span className="text-xs">Fund Trading Bot</span>
             <span className="text-[9px] bg-amber-500/30 text-amber-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Bank & Card
+              Stripe &amp; Ledger
             </span>
           </button>
 
@@ -566,14 +395,20 @@ This document certifies real-time clearing across banking rails.
             onClick={() => setActiveTab('CASH_CHECK')}
             className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'CASH_CHECK'
-                ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
+                ? 'bg-emerald-500/20 text-white border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <span className="text-sm">💵</span>
-            <span className="text-xs">Cash a Check</span>
-            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Mobile RDC
+            <FileCheck className="h-4 w-4 text-emerald-400" />
+            <span className="text-xs">Check Deposit</span>
+            <span
+              className={`text-[9px] px-2 py-0.5 rounded-full font-mono font-bold ${
+                checkRailInfo.active
+                  ? 'bg-emerald-500/30 text-emerald-200'
+                  : 'bg-amber-500/20 text-amber-300'
+              }`}
+            >
+              {checkRailInfo.active ? `Check 21 (${checkRailInfo.env || 'live'})` : 'Setup Required'}
             </span>
           </button>
 
@@ -587,9 +422,9 @@ This document certifies real-time clearing across banking rails.
             }`}
           >
             <ShieldCheck className="h-4 w-4 text-cyan-400" />
-            <span className="text-xs">Bank & Bot Security</span>
+            <span className="text-xs">Bank &amp; Bot Security</span>
             <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Fortress A+
+              {fiatAccount.twoFactorEnabled ? '2FA Active' : 'Setup 2FA'}
             </span>
           </button>
 
@@ -605,7 +440,39 @@ This document certifies real-time clearing across banking rails.
             <ArrowUpFromLine className="h-4 w-4 text-rose-400" />
             <span className="text-xs">Withdraw Funds</span>
             <span className="text-[9px] bg-rose-500/30 text-rose-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Payouts
+              PayPal Payouts
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('CRYPTO_TO_CASH')}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+              activeTab === 'CRYPTO_TO_CASH'
+                ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
+            }`}
+          >
+            <Coins className="h-4 w-4 text-emerald-400" />
+            <span className="text-xs">Crypto-to-Cash</span>
+            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-2 py-0.5 rounded-full font-mono font-bold">
+              Spot → PayPal
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('VAULT_TRANSFER')}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+              activeTab === 'VAULT_TRANSFER'
+                ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/60 shadow-md font-bold ring-1 ring-cyan-500/40'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
+            }`}
+          >
+            <Vault className="h-4 w-4 text-cyan-400" />
+            <span className="text-xs">Vault → Exchange</span>
+            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-bold">
+              Kraken / CEX
             </span>
           </button>
 
@@ -619,25 +486,9 @@ This document certifies real-time clearing across banking rails.
             }`}
           >
             <Landmark className="h-4 w-4 text-emerald-400" />
-            <span className="text-xs">+ Add Bank Account</span>
+            <span className="text-xs">+ Link Bank</span>
             <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              + Link Bank
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('ADD_CARD')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
-              activeTab === 'ADD_CARD'
-                ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/60 shadow-md font-bold ring-1 ring-cyan-500/40'
-                : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
-            }`}
-          >
-            <CreditCard className="h-4 w-4 text-cyan-400" />
-            <span className="text-xs">+ Add Check Card</span>
-            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              + Link Card
+              Plaid
             </span>
           </button>
 
@@ -651,9 +502,9 @@ This document certifies real-time clearing across banking rails.
             }`}
           >
             <ArrowDownToLine className="h-4 w-4 text-amber-400" />
-            <span className="text-xs">Deposit to Vault</span>
+            <span className="text-xs">Deposit to Ledger</span>
             <span className="text-[9px] bg-amber-500/30 text-amber-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Load Vault
+              Card &amp; Bank
             </span>
           </button>
 
@@ -667,7 +518,7 @@ This document certifies real-time clearing across banking rails.
             }`}
           >
             <ArrowLeftRight className="h-4 w-4 text-purple-400" />
-            <span className="text-xs">Vault ⇄ Bot Bridge</span>
+            <span className="text-xs">Ledger ⇄ Bot Bridge</span>
             <span className="text-[9px] bg-purple-500/30 text-purple-200 px-2 py-0.5 rounded-full font-mono font-bold">
               Margin Move
             </span>
@@ -692,13 +543,17 @@ This document certifies real-time clearing across banking rails.
 
         {/* Tab Content Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
-          {/* TAB: CASH A PERSONAL CHECK (MOBILE RDC) */}
+          {/* TAB: CHECK DEPOSIT NOTICE */}
           {activeTab === 'CASH_CHECK' && (
             <CashCheckModalTab
               fiatAccount={fiatAccount}
               onAccountUpdated={onAccountUpdated}
               onBotCashAdjusted={onBotCashAdjusted}
               botCash={botCash}
+              onSwitchToDeposit={(m) => {
+                setDepositMethod(m);
+                setActiveTab('DEPOSIT');
+              }}
             />
           )}
 
@@ -710,7 +565,7 @@ This document certifies real-time clearing across banking rails.
             />
           )}
 
-          {/* TAB: FUND TRADING BOT DIRECTLY FROM BANK OR CHECK CARD */}
+          {/* TAB: FUND TRADING BOT */}
           {activeTab === 'FUND_BOT' && (
             <div className="max-w-4xl mx-auto space-y-6 animate-in fade-in duration-200">
               {/* Receipt Banner if just completed */}
@@ -725,11 +580,11 @@ This document certifies real-time clearing across banking rails.
                         <h4 className="text-sm font-bold text-white flex items-center gap-2">
                           <span>Trading Bot Successfully Funded</span>
                           <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                            SETTLED & ACTIVE
+                            {fundSuccessReceipt.status}
                           </span>
                         </h4>
                         <p className="text-xs text-slate-300 mt-0.5">
-                          ${fundSuccessReceipt.amount.toFixed(2)} USD deposited into Bot Active Margin. The trading bot can now execute orders with these funds.
+                          ${(fundSuccessReceipt.netAmount ?? fundSuccessReceipt.amount).toFixed(2)} USD credited into Bot Active Margin.
                         </p>
                       </div>
                     </div>
@@ -744,9 +599,9 @@ This document certifies real-time clearing across banking rails.
 
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-800/80 text-xs">
                     <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <div className="text-[10px] text-slate-400 font-mono uppercase">Amount Funded</div>
+                      <div className="text-[10px] text-slate-400 font-mono uppercase">Net Credited</div>
                       <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
-                        +{formatCurrency(fundSuccessReceipt.amount)}
+                        +{formatCurrency(fundSuccessReceipt.netAmount ?? fundSuccessReceipt.amount)}
                       </div>
                     </div>
 
@@ -755,19 +610,15 @@ This document certifies real-time clearing across banking rails.
                       <div className="text-xs font-bold text-white truncate mt-0.5">
                         {fundSuccessReceipt.sourceName}
                       </div>
-                      <div className="text-[10px] text-slate-400 font-mono">Verified Rail</div>
+                      <div className="text-[10px] text-slate-400 font-mono">{fundSuccessReceipt.rail}</div>
                     </div>
 
                     <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <div className="text-[10px] text-slate-400 font-mono uppercase">Clearing Rail</div>
-                      <div className="text-xs font-bold text-cyan-300 mt-0.5">
-                        {fundSuccessReceipt.rail === 'FEDNOW_INSTANT'
-                          ? 'FedNow Instant (0s)'
-                          : fundSuccessReceipt.rail === 'DEBIT_PULL'
-                          ? 'Visa Direct / MC Pull'
-                          : 'Direct ACH'}
+                      <div className="text-[10px] text-slate-400 font-mono uppercase">Processor Fee</div>
+                      <div className="text-xs font-bold text-cyan-300 mt-0.5 font-mono">
+                        {formatCurrency(fundSuccessReceipt.fee || 0)}
                       </div>
-                      <div className="text-[10px] text-emerald-400 font-mono">$0.00 Fee Guaranteed</div>
+                      <div className="text-[10px] text-slate-400 font-mono">Gross: {formatCurrency(fundSuccessReceipt.amount)}</div>
                     </div>
 
                     <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
@@ -775,7 +626,7 @@ This document certifies real-time clearing across banking rails.
                       <div className="text-base font-black text-cyan-400 font-mono mt-0.5">
                         {formatCurrency(botCash)}
                       </div>
-                      <div className="text-[10px] text-slate-500">Ready to trade</div>
+                      <div className="text-[10px] text-slate-500">Live balance</div>
                     </div>
                   </div>
 
@@ -805,13 +656,6 @@ This document certifies real-time clearing across banking rails.
                     </button>
                   </div>
 
-                  {fundSuccessReceipt.id.includes('3ds') && (
-                    <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/40 border border-emerald-500/40 text-[11px] text-emerald-300 font-mono">
-                      <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" />
-                      <span>3D Secure 2.2 SCA Verified • EMVCo Cryptogram Authorized • Issuer Liability Shift Active</span>
-                    </div>
-                  )}
-
                   <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
                     <button
                       type="button"
@@ -819,7 +663,7 @@ This document certifies real-time clearing across banking rails.
                       className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-400 hover:text-emerald-300 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 border border-emerald-500/30"
                     >
                       <Download className="h-3.5 w-3.5" />
-                      <span>Download Receipt (.txt)</span>
+                      <span>Download Record (.txt)</span>
                     </button>
                     <button
                       type="button"
@@ -834,7 +678,7 @@ This document certifies real-time clearing across banking rails.
                       className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-black text-xs transition-all cursor-pointer flex items-center gap-1.5 shadow-md shadow-emerald-500/20"
                     >
                       <Zap className="h-3.5 w-3.5" />
-                      <span>Start Bot with New Margin</span>
+                      <span>Return to Desk</span>
                     </button>
                   </div>
                 </div>
@@ -849,13 +693,13 @@ This document certifies real-time clearing across banking rails.
                     </div>
                     <div>
                       <h3 className="text-base sm:text-lg font-bold text-white tracking-wide flex items-center gap-2">
-                        <span>Fund Trading Bot from Bank or Check Card</span>
+                        <span>Fund Trading Bot (Live USD Only)</span>
                         <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
                           Direct to Margin
                         </span>
                       </h3>
                       <p className="text-xs text-slate-400 mt-0.5">
-                        Transfers credit immediately to Bot Active Margin so automated strategies can execute live and simulated orders.
+                        Fund Bot Active Margin via live Stripe card payments or transfer settled USD from your ledger.
                       </p>
                     </div>
                   </div>
@@ -876,7 +720,32 @@ This document certifies real-time clearing across banking rails.
                       1. Select Funding Source
                     </label>
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                      {/* Option A: Bank Account */}
+                      {/* Option A: Card via Stripe */}
+                      <div
+                        onClick={() => setFundBotSourceType('CARD')}
+                        className={`p-4 rounded-xl border cursor-pointer transition-all ${
+                          fundBotSourceType === 'CARD'
+                            ? 'bg-cyan-950/30 border-cyan-500/80 ring-2 ring-cyan-500/40 shadow-lg shadow-cyan-500/10'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="p-2 rounded-lg bg-cyan-500/20 text-cyan-300">
+                              <CreditCard className="h-4 w-4" />
+                            </div>
+                            <span className="text-sm font-bold text-white">Debit / Credit Card</span>
+                          </div>
+                          <span className="text-[9px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-bold">
+                            Stripe
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-2">
+                          Pay with Stripe Elements. Net settled USD is credited directly to Bot Margin.
+                        </div>
+                      </div>
+
+                      {/* Option B: Bank Account */}
                       <div
                         onClick={() => setFundBotSourceType('BANK')}
                         className={`p-4 rounded-xl border cursor-pointer transition-all ${
@@ -893,50 +762,20 @@ This document certifies real-time clearing across banking rails.
                             <span className="text-sm font-bold text-white">Bank Account</span>
                           </div>
                           <span className="text-[9px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
-                            FedNow 0s
+                            Plaid ACH
                           </span>
                         </div>
                         <div className="text-xs text-slate-400 mt-2">
-                          US checking or savings account. Real-time FedNow instant settlement or ACH.
+                          US bank via Plaid + Stripe ACH. Settles into USD Ledger first (~4 business days).
                         </div>
                         {fiatAccount.linkedBanks.length > 0 && (
                           <div className="text-[10px] text-cyan-300 font-mono mt-2">
-                            {fiatAccount.linkedBanks.length} connected bank{fiatAccount.linkedBanks.length > 1 ? 's' : ''} available
+                            {fiatAccount.linkedBanks.length} linked bank{fiatAccount.linkedBanks.length > 1 ? 's' : ''}
                           </div>
                         )}
                       </div>
 
-                      {/* Option B: Check Card / Debit Card */}
-                      <div
-                        onClick={() => setFundBotSourceType('CARD')}
-                        className={`p-4 rounded-xl border cursor-pointer transition-all ${
-                          fundBotSourceType === 'CARD'
-                            ? 'bg-cyan-950/30 border-cyan-500/80 ring-2 ring-cyan-500/40 shadow-lg shadow-cyan-500/10'
-                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <div className="p-2 rounded-lg bg-cyan-500/20 text-cyan-300">
-                              <CreditCard className="h-4 w-4" />
-                            </div>
-                            <span className="text-sm font-bold text-white">Check / Debit Card</span>
-                          </div>
-                          <span className="text-[9px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-bold">
-                            Instant Pull
-                          </span>
-                        </div>
-                        <div className="text-xs text-slate-400 mt-2">
-                          Instant card pull via Visa Direct or Mastercard. Funds clear in 0 seconds.
-                        </div>
-                        {fiatAccount.linkedCards.length > 0 && (
-                          <div className="text-[10px] text-cyan-300 font-mono mt-2">
-                            {fiatAccount.linkedCards.length} saved check card{fiatAccount.linkedCards.length > 1 ? 's' : ''} ready
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Option C: Live Treasury Vault */}
+                      {/* Option C: USD Ledger */}
                       <div
                         onClick={() => setFundBotSourceType('VAULT')}
                         className={`p-4 rounded-xl border cursor-pointer transition-all ${
@@ -950,14 +789,14 @@ This document certifies real-time clearing across banking rails.
                             <div className="p-2 rounded-lg bg-purple-500/20 text-purple-300">
                               <Landmark className="h-4 w-4" />
                             </div>
-                            <span className="text-sm font-bold text-white">Treasury Vault</span>
+                            <span className="text-sm font-bold text-white">USD Ledger</span>
                           </div>
                           <span className="text-[9px] font-mono px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 font-bold">
                             Internal
                           </span>
                         </div>
                         <div className="text-xs text-slate-400 mt-2">
-                          Move existing funds from Live USD Treasury Vault into Bot Trading Margin.
+                          Move settled USD from your Live Ledger balance into Bot Active Margin.
                         </div>
                         <div className="text-[10px] text-emerald-400 font-mono mt-2">
                           {formatCurrency(fiatAccount.availableBalance)} available
@@ -966,14 +805,58 @@ This document certifies real-time clearing across banking rails.
                     </div>
                   </div>
 
-                  {/* STEP 2: SOURCE CONFIGURATION */}
-                  {/* WHEN SOURCE IS BANK ACCOUNT: ACH goes to the ledger first */}
+                  {/* STEP 2: FUNDING AMOUNT (for CARD and VAULT) */}
+                  {fundBotSourceType !== 'BANK' && (
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                          2. Amount (USD)
+                        </label>
+                        <span className="text-xs text-slate-400 font-mono">
+                          {fundBotSourceType === 'CARD' ? 'Min: $0.50 (Stripe fee applies)' : 'Min: $0.01 · No internal fee'}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 mb-2.5">
+                        {[25, 100, 250, 500, 1000, 2500].map((preset) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() => setFundBotAmount(String(preset))}
+                            className={`px-3 py-1.5 rounded-xl border text-xs font-mono font-bold cursor-pointer transition-all ${
+                              fundBotAmount === String(preset)
+                                ? 'bg-amber-500/20 border-amber-500 text-amber-200 shadow-sm'
+                                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                            }`}
+                          >
+                            +${preset.toLocaleString()}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="relative">
+                        <span className="absolute left-4 top-2.5 text-slate-400 font-mono text-xl font-bold">$</span>
+                        <input
+                          type="number"
+                          min={fundBotSourceType === 'CARD' ? '0.50' : '0.01'}
+                          step="0.01"
+                          value={fundBotAmount}
+                          onChange={(e) => setFundBotAmount(e.target.value)}
+                          placeholder="500.00"
+                          className="w-full bg-slate-950 border border-slate-700 text-white pl-9 pr-4 py-2.5 rounded-xl font-mono text-2xl font-black focus:outline-none focus:border-amber-500"
+                          required
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* STEP 3: SOURCE ACTION */}
                   {fundBotSourceType === 'BANK' && (
                     <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-2xl space-y-3 text-xs text-slate-300">
                       <div className="font-bold text-white">Bank (ACH) deposits go to your USD ledger first</div>
                       <p>
-                        ACH takes about 4 business days and can be returned by the bank after it clears, so it cannot fund the bot directly. Deposit from your bank
-                        on the Bank tab, then use Transfer to Bot once the funds settle. For instant funding use the Card source.
+                        ACH takes about 4 business days and can be returned by the bank after it settles, so it cannot fund the bot directly. Deposit from your bank
+                        on the Bank tab, then transfer to Bot once settled.
                       </p>
                       <button
                         type="button"
@@ -983,12 +866,11 @@ This document certifies real-time clearing across banking rails.
                         }}
                         className="px-3 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold cursor-pointer"
                       >
-                        Go to bank deposit
+                        Go to Bank Deposit
                       </button>
                     </div>
                   )}
 
-                  {/* WHEN SOURCE IS CARD: real Stripe Elements form */}
                   {fundBotSourceType === 'CARD' && (
                     <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-2xl space-y-3">
                       <StripeCardDeposit
@@ -1001,151 +883,67 @@ This document certifies real-time clearing across banking rails.
                     </div>
                   )}
 
-                  {/* WHEN SOURCE IS TREASURY VAULT */}
                   {fundBotSourceType === 'VAULT' && (
-                    <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-2xl space-y-3">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="text-slate-300 font-bold">Live Vault Balance Available:</span>
-                        <span className="font-mono text-base font-black text-emerald-400">
-                          {formatCurrency(fiatAccount.availableBalance)}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-400">
-                        Transfer settled USD from your custodial vault directly into active bot margin. Instant clearing, zero fee.
-                      </p>
-                      <div className="flex gap-2 pt-1">
-                        {[0.25, 0.5, 0.75, 1].map((pct) => (
-                          <button
-                            key={pct}
-                            type="button"
-                            onClick={() => setFundBotAmount(String(Math.floor(fiatAccount.availableBalance * pct)))}
-                            className="flex-1 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800/80 border border-slate-800 hover:border-purple-500/40 text-slate-300 font-mono text-xs font-bold cursor-pointer transition-all"
-                          >
-                            {pct === 1 ? 'MAX (100%)' : `${pct * 100}%`}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* STEP 3: FUNDING AMOUNT */}
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-                        2. Transfer Amount to Bot (USD)
-                      </label>
-                      <span className="text-xs text-slate-400 font-mono">
-                        Min: $0.01 • Zero Fee
-                      </span>
-                    </div>
-
-                    {/* Quick Amount Chips */}
-                    <div className="flex flex-wrap gap-2 mb-2.5">
-                      {[100, 250, 500, 1000, 2500, 5000, 10000].map((preset) => (
-                        <button
-                          key={preset}
-                          type="button"
-                          onClick={() => setFundBotAmount(String(preset))}
-                          className={`px-3 py-1.5 rounded-xl border text-xs font-mono font-bold cursor-pointer transition-all ${
-                            fundBotAmount === String(preset)
-                              ? 'bg-amber-500/20 border-amber-500 text-amber-200 shadow-sm'
-                              : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
-                          }`}
-                        >
-                          +${preset.toLocaleString()}
-                        </button>
-                      ))}
-                    </div>
-
-                    <div className="relative">
-                      <span className="absolute left-4 top-2.5 text-slate-400 font-mono text-xl font-bold">$</span>
-                      <input
-                        type="number"
-                        min="0.01"
-                        step="0.01"
-                        value={fundBotAmount}
-                        onChange={(e) => setFundBotAmount(e.target.value)}
-                        placeholder="500.00"
-                        className="w-full bg-slate-950 border border-slate-700 text-white pl-9 pr-4 py-2.5 rounded-xl font-mono text-2xl font-black focus:outline-none focus:border-amber-500"
-                        required
-                      />
-                    </div>
-                  </div>
-
-                  {/* STEP 4: REAL-TIME TRANSFER SUMMARY */}
-                  <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2 text-xs">
-                    <div className="flex justify-between text-slate-400">
-                      <span>Funding Source:</span>
-                      <span className="font-semibold text-slate-200">
-                        {fundBotSourceType === 'BANK'
-                          ? `${newBankName || 'Connected Bank'} (FedNow Instant)`
-                          : fundBotSourceType === 'CARD'
-                          ? 'Card (charged through Stripe)'
-                          : 'Live USD Treasury Vault'}
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between text-slate-400">
-                      <span>Destination Target:</span>
-                      <span className="font-semibold text-amber-300">
-                        Bot Active Margin (Trading Cash)
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between text-slate-400">
-                      <span>Transfer Rail & Settlement:</span>
-                      <span className="text-cyan-300 font-semibold font-mono">
-                        {fundBotSourceType === 'BANK'
-                          ? transferSpeed === 'INSTANT_FEDNOW' ? 'FedNow 0s Instant Settlement' : 'Direct ACH (Same-Day)'
-                          : fundBotSourceType === 'CARD'
-                          ? 'Stripe card payment (3-D Secure when your bank requires it)'
-                          : 'Internal Ledger Bridge'}
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between text-slate-400">
-                      <span>Network Transfer Fee:</span>
-                      <span className="text-emerald-400 font-mono font-bold">
-                        {fundBotSourceType === 'CARD' ? 'Stripe fee is deducted from the credited amount' : '$0.00'}
-                      </span>
-                    </div>
-
-                    <div className="pt-2 border-t border-slate-800 flex justify-between items-baseline">
-                      <div>
-                        <div className="text-slate-400 text-[11px]">Updated Bot Trading Margin:</div>
-                        <div className="text-slate-500 text-[10px]">
-                          ${botCash.toFixed(2)} + ${parseFloat(fundBotAmount || '0').toFixed(2)}
+                    <>
+                      <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-2xl space-y-3">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-300 font-bold">Live USD Ledger Available:</span>
+                          <span className="font-mono text-base font-black text-emerald-400">
+                            {formatCurrency(fiatAccount.availableBalance)}
+                          </span>
                         </div>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-lg font-black font-mono text-emerald-400">
-                          {formatCurrency(botCash + (parseFloat(fundBotAmount || '0') || 0))} USD
-                        </span>
-                      </div>
-                    </div>
-                  </div>
+                        <div className="flex gap-2 pt-1">
+                          {[0.25, 0.5, 0.75, 1].map((pct) => (
+                            <button
+                              key={pct}
+                              type="button"
+                              onClick={() => setFundBotAmount(String(Math.floor(fiatAccount.availableBalance * pct * 100) / 100))}
+                              className="flex-1 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800/80 border border-slate-800 hover:border-purple-500/40 text-slate-300 font-mono text-xs font-bold cursor-pointer transition-all"
+                            >
+                              {pct === 1 ? 'MAX (100%)' : `${pct * 100}%`}
+                            </button>
+                          ))}
+                        </div>
 
-                  {/* STEP 5: SUBMIT BUTTON (card payments use the Stripe form's own button) */}
-                  {fundBotSourceType !== 'CARD' && fundBotSourceType !== 'BANK' && (
-                  <button
-                    type="submit"
-                    disabled={isLoading || parseFloat(fundBotAmount || '0') <= 0}
-                    className="w-full py-4 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-yellow-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-sm uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer shadow-xl shadow-amber-500/20 transition-all disabled:opacity-50 active:scale-[0.99]"
-                  >
-                    {isLoading ? (
-                      <div className="flex items-center gap-2">
-                        <RefreshCw className="h-4 w-4 animate-spin" />
-                        <span>Clearing Transfer via Financial Rails...</span>
+                        {(transfer2FaNeeded || (parseFloat(fundBotAmount) || 0) >= 2000) && (
+                          <div>
+                            <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">
+                              6-digit 2FA Code (required for transfers ≥ $2,000)
+                            </label>
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              autoComplete="one-time-code"
+                              maxLength={6}
+                              value={transfer2FaCode}
+                              onChange={(e) => setTransfer2FaCode(e.target.value.replace(/\D/g, ''))}
+                              placeholder="123456"
+                              className="w-40 bg-slate-900 border border-slate-700 text-white px-3 py-2 rounded-lg font-mono text-sm focus:outline-none focus:border-purple-500"
+                            />
+                          </div>
+                        )}
                       </div>
-                    ) : (
-                      <>
-                        <Zap className="h-5 w-5" />
-                        <span>
-                          {`Complete Transfer & Fund Bot: $${parseFloat(fundBotAmount || '0').toFixed(2)} USD`}
-                        </span>
-                      </>
-                    )}
-                  </button>
+
+                      <button
+                        type="submit"
+                        disabled={isLoading || parseFloat(fundBotAmount || '0') <= 0 || parseFloat(fundBotAmount || '0') > fiatAccount.availableBalance}
+                        className="w-full py-4 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-yellow-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-sm uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer shadow-xl shadow-amber-500/20 transition-all disabled:opacity-50 active:scale-[0.99]"
+                      >
+                        {isLoading ? (
+                          <div className="flex items-center gap-2">
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                            <span>Updating Live Ledger...</span>
+                          </div>
+                        ) : (
+                          <>
+                            <Zap className="h-5 w-5" />
+                            <span>
+                              {`Transfer Settled USD to Bot: $${(parseFloat(fundBotAmount || '0') || 0).toFixed(2)} USD`}
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    </>
                   )}
                 </form>
               </div>
@@ -1162,7 +960,7 @@ This document certifies real-time clearing across banking rails.
                   </div>
                   <div>
                     <h3 className="text-lg font-bold text-white tracking-wide">Link a bank account</h3>
-                    <p className="text-xs text-slate-400">Verified through Plaid and used for ACH deposits through Stripe. Withdrawals to a bank are not available here.</p>
+                    <p className="text-xs text-slate-400">Verified through Plaid and used for ACH deposits through Stripe. Withdrawals use PayPal Payouts.</p>
                   </div>
                 </div>
                 <PlaidBankDeposit
@@ -1177,237 +975,22 @@ This document certifies real-time clearing across banking rails.
             </div>
           )}
 
-          {/* TAB: ADD NEW DEBIT CARD (DEDICATED FULL-SPACE VIEW) */}
-          {activeTab === 'ADD_CARD' && (
-            <div className="max-w-4xl mx-auto space-y-6 animate-in fade-in duration-200">
-              <div className="p-6 bg-slate-900/90 border border-cyan-500/30 rounded-2xl shadow-xl space-y-6">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-400">
-                      <CreditCard className="h-6 w-6" />
-                    </div>
-                    <div>
-                      <h3 className="text-lg font-bold text-white tracking-wide">
-                        Link Debit Card for Instant Push Withdrawals
-                      </h3>
-                      <p className="text-xs text-slate-400">
-                        Powered by Visa Direct & Mastercard Send. Funds reflect in your bank account in under 30 minutes.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 self-start sm:self-auto">
-                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">
-                      <Zap className="h-3.5 w-3.5" />
-                      Instant 30-Min Push
-                    </span>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-                  {/* Visual Card Preview with Interactive Flip */}
-                  <div className="md:col-span-5 flex flex-col justify-between space-y-4">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-mono text-slate-400">Interactive Card Preview</span>
-                      <button
-                        type="button"
-                        onClick={() => setIsCardFlipped(!isCardFlipped)}
-                        className="flex items-center gap-1 text-[11px] font-mono text-cyan-400 hover:text-cyan-300 cursor-pointer px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 transition-colors"
-                      >
-                        <RotateCw className="h-3 w-3" />
-                        <span>Flip {isCardFlipped ? 'to Front' : 'to Back (CVV)'}</span>
-                      </button>
-                    </div>
-
-                    {!isCardFlipped ? (
-                      /* Card Front */
-                      <div
-                        onClick={() => setIsCardFlipped(true)}
-                        className="relative h-52 w-full rounded-2xl p-5 bg-gradient-to-tr from-slate-900 via-slate-800 to-cyan-950 border border-cyan-500/40 shadow-2xl flex flex-col justify-between overflow-hidden cursor-pointer transition-transform hover:scale-[1.01]"
-                        title="Click to flip card to back"
-                      >
-                        <div className="absolute top-0 right-0 w-36 h-36 bg-cyan-500/15 rounded-full blur-2xl pointer-events-none" />
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <div className="h-7 w-10 bg-amber-400/20 border border-amber-400/40 rounded flex items-center justify-center">
-                              <div className="w-5 h-4 border border-amber-400/60 rounded-sm" />
-                            </div>
-                            <span className="text-[10px] font-mono text-cyan-300 font-semibold tracking-wider">
-                              DEBIT RAIL
-                            </span>
-                          </div>
-                          <span className="text-sm font-bold font-mono tracking-widest text-white">
-                            {newCardNumber.startsWith('4') ? 'VISA' : newCardNumber.startsWith('5') ? 'MASTERCARD' : 'VISA / MC'}
-                          </span>
-                        </div>
-
-                        <div className="my-auto">
-                          <div className="font-mono text-lg tracking-[0.2em] text-white font-bold drop-shadow">
-                            {newCardNumber ? newCardNumber.padEnd(19, '•') : '•••• •••• •••• ••••'}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center justify-between text-xs font-mono">
-                          <div>
-                            <div className="text-[8px] uppercase tracking-wider text-slate-400">Cardholder</div>
-                            <div className="text-slate-200 font-semibold truncate max-w-[150px]">
-                              {newCardHolder || 'PRIMARY TRADER'}
-                            </div>
-                          </div>
-                          <div>
-                            <div className="text-[8px] uppercase tracking-wider text-slate-400">Expires</div>
-                            <div className="text-slate-200 font-semibold">
-                              {newCardExpMonth}/{newCardExpYear.slice(-2)}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      /* Card Back */
-                      <div
-                        onClick={() => setIsCardFlipped(false)}
-                        className="relative h-52 w-full rounded-2xl bg-gradient-to-tr from-slate-950 via-slate-900 to-slate-800 border border-cyan-500/40 shadow-2xl flex flex-col justify-between overflow-hidden cursor-pointer transition-transform hover:scale-[1.01]"
-                        title="Click to flip card to front"
-                      >
-                        <div className="h-10 w-full bg-slate-950 mt-4 border-y border-slate-800" />
-                        <div className="px-5 space-y-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-[8px] uppercase font-mono text-slate-400">Authorized Signature</span>
-                            <span className="text-[8px] uppercase font-mono text-slate-400">CVV/CVC</span>
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <div className="flex-1 h-8 bg-slate-100/90 rounded px-3 flex items-center font-serif italic text-slate-800 text-xs select-none">
-                              {newCardHolder || 'Authorized Trader'}
-                            </div>
-                            <div className="h-8 w-14 bg-slate-900 border border-slate-700 rounded flex items-center justify-center font-mono font-bold text-amber-300 text-sm">
-                              {newCardCvc || '•••'}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="px-5 pb-4 flex items-center justify-between text-[8px] font-mono text-slate-500">
-                          <span>Custodial Card Services • 1-800-APEX-USD</span>
-                          <span className="text-cyan-400 font-bold">PCI-DSS TIER 1</span>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="p-3.5 bg-slate-950/60 rounded-xl border border-slate-800 text-xs space-y-2 text-slate-400">
-                      <div className="flex items-center gap-2 text-slate-300 font-semibold">
-                        <Lock className="h-3.5 w-3.5 text-cyan-400" />
-                        <span>PCI-DSS Tier 1 Encrypted Vault</span>
-                      </div>
-                      <p>
-                        Cards are tokenized and stored securely. You can withdraw directly to this card anytime with instant confirmation.
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Card Entry Form */}
-                  <div className="md:col-span-7">
-                    <div className="rounded-2xl border border-amber-500/40 bg-amber-950/20 p-4 text-xs text-amber-100 space-y-1.5">
-  <div className="font-bold">Card payouts are not available</div>
-  <p>
-    This app has no payout provider, so it cannot send money to a card, and it no longer collects card numbers for that purpose.
-    Withdraw from your exchange or payment processor dashboard. Card <em>deposits</em> use Stripe on the Deposit tab.
-  </p>
-</div>
-                  </div>
-                </div>
-              </div>
-
-              {/* List of currently linked debit cards */}
-              <div>
-                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
-                  Currently Linked Debit Cards ({fiatAccount.linkedCards.length})
-                </h4>
-                {fiatAccount.linkedCards.length === 0 ? (
-                  <div className="p-6 rounded-xl bg-slate-900/40 border border-dashed border-slate-800 text-center">
-                    <CreditCard className="h-8 w-8 text-slate-500 mx-auto mb-2" />
-                    <div className="text-sm font-medium text-slate-300">No Debit Cards Linked</div>
-                    <div className="text-xs text-slate-500 mt-1">Use the card entry form above to link a card for instant deposits and payouts.</div>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {fiatAccount.linkedCards.map((card) => (
-                      <div
-                        key={card.id}
-                        className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 flex items-center justify-between"
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className="p-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-cyan-400">
-                            <CreditCard className="h-5 w-5" />
-                          </div>
-                          <div>
-                            <div className="text-sm font-bold text-white flex items-center gap-2">
-                              <span>{card.brand} •••• {card.last4}</span>
-                              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                                Instant Push
-                              </span>
-                            </div>
-                            <div className="text-xs text-slate-400 font-mono mt-0.5">
-                              {card.cardholderName} | Exp: {String(card.expMonth).padStart(2, '0')}/{String(card.expYear).slice(-2)}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setWithdrawCardId(card.id);
-                              setWithdrawDestinationType('CARD');
-                              setActiveTab('WITHDRAW');
-                            }}
-                            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-cyan-300 border border-slate-700 cursor-pointer transition-all"
-                          >
-                            Withdraw
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveCard(card.id, card.brand, card.last4)}
-                            className="p-1.5 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 cursor-pointer transition-all"
-                            title="Disconnect and remove debit card"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
           {/* UNIFIED DEPOSIT HEADER & RAIL SELECTOR */}
-          {(activeTab === 'DEPOSIT' || activeTab === 'DEBIT_CARD' || activeTab === 'BANK_TRANSFER') && (
+          {(activeTab === 'DEPOSIT' || activeTab === 'DEBIT_CARD' || activeTab === 'BANK_TRANSFER' || activeTab === 'ADD_CARD') && (
             <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-2xl space-y-4 mb-5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
                 <div>
                   <h3 className="text-sm font-bold text-white flex items-center gap-2">
                     <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
-                    <span>Deposit Funds to Trading Account</span>
+                    <span>Deposit Live USD Funds</span>
                   </h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Transfer USD from connected banks via FedNow instant (0s), standard ACH, or instant debit card pull.
+                    Deposit USD via Stripe card checkout or Plaid + Stripe ACH bank debit.
                   </p>
                 </div>
 
                 {/* Rail Selector */}
                 <div className="flex items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-xl">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveTab('DEPOSIT');
-                      setDepositMethod('BANK');
-                    }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
-                      depositMethod === 'BANK'
-                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <Building2 className="h-3.5 w-3.5" />
-                    <span>Connected Bank (FedNow / ACH)</span>
-                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -1421,112 +1004,90 @@ This document certifies real-time clearing across banking rails.
                     }`}
                   >
                     <CreditCard className="h-3.5 w-3.5" />
-                    <span>Debit Card (Instant)</span>
+                    <span>Card Payment (Stripe)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTab('DEPOSIT');
+                      setDepositMethod('BANK');
+                    }}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
+                      depositMethod === 'BANK'
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Building2 className="h-3.5 w-3.5" />
+                    <span>Connected Bank (Plaid ACH)</span>
                   </button>
                 </div>
               </div>
 
-              {/* Destination Target: Direct to Bot vs Live Vault */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-slate-900/60 border border-slate-800 rounded-xl">
-                <div>
-                  <div className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                    <Zap className="h-3.5 w-3.5 text-amber-400" />
-                    <span>Deposit Destination Target:</span>
+              {/* Destination Target: Direct to Bot vs Live USD Ledger */}
+              {depositMethod === 'CARD' && (
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-slate-900/60 border border-slate-800 rounded-xl">
+                  <div>
+                    <div className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                      <Zap className="h-3.5 w-3.5 text-amber-400" />
+                      <span>Deposit Destination Target:</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-0.5">
+                      {depositTarget === 'BOT'
+                        ? 'Net Stripe proceeds credit Bot Active Margin so orders can run immediately.'
+                        : 'Net Stripe proceeds stay in your Live USD Ledger until you transfer them.'}
+                    </p>
                   </div>
-                  <p className="text-[10px] text-slate-400 mt-0.5">
-                    {depositTarget === 'BOT'
-                      ? '⚡ Funds directly increase Bot Active Margin (Portfolio Cash) so the bot trades immediately.'
-                      : '🏛 Funds are safely stored in your Live USD Treasury Vault. Transfer to bot anytime in Bot Margin Transfer.'}
-                  </p>
-                </div>
 
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setDepositTarget('BOT')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
-                      depositTarget === 'BOT'
-                        ? 'bg-emerald-500 text-slate-950 shadow-md ring-2 ring-emerald-400/40 font-extrabold'
-                        : 'bg-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <Zap className="h-3.5 w-3.5" />
-                    <span>Direct to Bot Trading Cash</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setDepositTarget('VAULT')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
-                      depositTarget === 'VAULT'
-                        ? 'bg-cyan-500 text-slate-950 shadow-md ring-2 ring-cyan-400/40 font-extrabold'
-                        : 'bg-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    <Landmark className="h-3.5 w-3.5" />
-                    <span>Live Vault Treasury</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setDepositTarget('BOT')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+                        depositTarget === 'BOT'
+                          ? 'bg-emerald-500 text-slate-950 shadow-md ring-2 ring-emerald-400/40 font-extrabold'
+                          : 'bg-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <Zap className="h-3.5 w-3.5" />
+                      <span>Direct to Bot Trading Cash</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDepositTarget('VAULT')}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+                        depositTarget === 'VAULT'
+                          ? 'bg-cyan-500 text-slate-950 shadow-md ring-2 ring-cyan-400/40 font-extrabold'
+                          : 'bg-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      <Landmark className="h-3.5 w-3.5" />
+                      <span>Live USD Ledger</span>
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           )}
 
-          {/* TAB 1: DEBIT CARD LOADING */}
-          {((activeTab === 'DEPOSIT' && depositMethod === 'CARD') || activeTab === 'DEBIT_CARD') && (
+          {/* TAB 1: STRIPE CARD DEPOSIT */}
+          {(((activeTab === 'DEPOSIT' || activeTab === 'ADD_CARD') && depositMethod === 'CARD') || activeTab === 'DEBIT_CARD') && (
             <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-              {/* Left Column: Visual Debit Card */}
+              {/* Left Column: Honest Stripe Settlement Details */}
               <div className="md:col-span-5 flex flex-col justify-between space-y-4">
-                <div className="relative h-48 w-full rounded-2xl p-5 bg-gradient-to-tr from-slate-900 via-slate-800 to-cyan-950 border border-cyan-500/30 shadow-xl flex flex-col justify-between overflow-hidden group">
-                  <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/10 rounded-full blur-2xl pointer-events-none" />
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className="h-7 w-10 bg-amber-400/20 border border-amber-400/40 rounded flex items-center justify-center">
-                        <div className="w-5 h-4 border border-amber-400/60 rounded-sm" />
-                      </div>
-                      <span className="text-[10px] font-mono text-cyan-300 font-semibold tracking-wider">DEBIT RAIL</span>
-                    </div>
-                    <span className="text-sm font-bold font-mono tracking-widest text-white">
-                      {selectedCardId === 'NEW' ? 'VISA / MC' : activeCard?.brand || 'VISA'}
-                    </span>
+                <div className="p-5 rounded-2xl bg-slate-950/80 border border-cyan-500/30 space-y-3">
+                  <div className="flex items-center gap-2 text-cyan-300 font-bold text-sm">
+                    <Lock className="h-4 w-4 text-cyan-400" />
+                    <span>Live Stripe Card Settlement</span>
                   </div>
-
-                  <div className="my-auto">
-                    <div className="font-mono text-base tracking-[0.2em] text-white font-bold">
-                      {selectedCardId === 'NEW'
-                        ? newCardNumber
-                          ? newCardNumber.padEnd(19, '•')
-                          : '•••• •••• •••• ••••'
-                        : `•••• •••• •••• ${activeCard?.last4 || '4242'}`}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between text-[11px] font-mono">
-                    <div>
-                      <div className="text-[8px] uppercase tracking-wider text-slate-400">Cardholder</div>
-                      <div className="text-slate-200 font-semibold truncate max-w-[140px]">
-                        {selectedCardId === 'NEW' ? newCardHolder || 'CARDHOLDER' : activeCard?.cardholderName}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="text-[8px] uppercase tracking-wider text-slate-400">Expires</div>
-                      <div className="text-slate-200 font-semibold">
-                        {selectedCardId === 'NEW'
-                          ? `${newCardExpMonth}/${newCardExpYear.slice(-2)}`
-                          : `${String(activeCard?.expMonth || 12).padStart(2, '0')}/${String(
-                              activeCard?.expYear || 2029
-                            ).slice(-2)}`}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-800 text-[11px] space-y-2 text-slate-400">
-                  <div className="flex items-center gap-2 text-slate-300 font-semibold">
-                    <Lock className="h-3.5 w-3.5 text-cyan-400" />
-                    <span>PCI-DSS Tier 1 Encrypted Tokenization</span>
-                  </div>
-                  <p>
-                    Card details are entered in Stripe's secure fields and never touch this app or its server. Stripe's processing fee is deducted from the amount credited, and your bank may ask for 3-D Secure.
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Card numbers, expiry dates, and CVCs are collected directly inside Stripe Elements. This server never sees or stores raw card details.
                   </p>
+                  <ul className="text-[11px] text-slate-400 space-y-1.5 list-disc pl-4">
+                    <li>Minimum deposit: $0.50 USD</li>
+                    <li>3-D Secure authentication is triggered automatically when required by your issuing bank</li>
+                    <li>Net settlement (after Stripe processing fees) is credited only after Stripe confirms settlement</li>
+                  </ul>
                 </div>
               </div>
 
@@ -1580,11 +1141,49 @@ This document certifies real-time clearing across banking rails.
             <div className="max-w-3xl mx-auto space-y-4">
               <PayPalWithdraw
                 availableBalance={fiatAccount.availableBalance}
+                allocatedToTrading={fiatAccount.allocatedToTrading}
                 onAccountUpdated={(account, message) => {
                   onAccountUpdated(account, message);
                   showFeedback('success', message);
                 }}
+                onBotCashAdjusted={onBotCashAdjusted}
+                onSwitchToDeposit={() => {
+                  setDepositMethod('CARD');
+                  setActiveTab('DEPOSIT');
+                }}
+                onSwitchToCryptoToCash={() => setActiveTab('CRYPTO_TO_CASH')}
                 onError={(m) => showFeedback('error', m)}
+              />
+            </div>
+          )}
+
+          {/* TAB 3B: CRYPTO-TO-CASH PAYOUTS (SPOT SELL -> PAYPAL PAYOUTS) */}
+          {activeTab === 'CRYPTO_TO_CASH' && (
+            <CryptoToCashTab
+              fiatAccount={fiatAccount}
+              transactions={transactions}
+              positions={positions}
+              assets={assets}
+              onAccountUpdated={(account, message) => {
+                onAccountUpdated(account, message);
+                if (message) showFeedback('success', message);
+              }}
+              onPositionLiquidated={onPositionLiquidated}
+              onError={(m) => showFeedback('error', m)}
+            />
+          )}
+
+          {/* TAB 3C: PROFIT VAULT -> KRAKEN / EXCHANGE TRANSFER */}
+          {activeTab === 'VAULT_TRANSFER' && (
+            <div className="max-w-4xl mx-auto">
+              <VaultToExchangeTransfer
+                defaultExchange="KRAKEN"
+                onTransferComplete={(info) => {
+                  showFeedback(
+                    'success',
+                    `Sent ${info.amount} ${info.asset} from Vault to ${info.exchange} (${info.txHash.slice(0, 10)}...)`
+                  );
+                }}
               />
             </div>
           )}
@@ -1594,9 +1193,9 @@ This document certifies real-time clearing across banking rails.
             <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-2xl space-y-4">
               <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                 <div>
-                  <h3 className="text-xs font-bold text-white">Bridge Live Treasury & Algorithmic Trading Bot</h3>
+                  <h3 className="text-xs font-bold text-white">Bridge Live USD Ledger &amp; Trading Bot</h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Move funds instantly between your secure live currency account and the active crypto trading margin.
+                    Move settled USD between your live currency ledger and active bot trading margin.
                   </p>
                 </div>
                 <div className="text-right font-mono text-xs">
@@ -1618,9 +1217,9 @@ This document certifies real-time clearing across banking rails.
                   >
                     <div className="text-xs font-bold flex items-center gap-1.5 text-emerald-400">
                       <ArrowDownToLine className="h-3.5 w-3.5" />
-                      <span>Deposit to Trading Bot</span>
+                      <span>Allocate to Trading Bot</span>
                     </div>
-                    <div className="text-[10px] text-slate-400 mt-1">Live Fiat Vault ➔ Bot Trading Cash</div>
+                    <div className="text-[10px] text-slate-400 mt-1">Live USD Ledger ➔ Bot Trading Cash</div>
                   </button>
 
                   <button
@@ -1634,9 +1233,9 @@ This document certifies real-time clearing across banking rails.
                   >
                     <div className="text-xs font-bold flex items-center gap-1.5 text-cyan-400">
                       <ArrowUpFromLine className="h-3.5 w-3.5" />
-                      <span>Secure Bot Profits to Vault</span>
+                      <span>Return Bot Cash to Ledger</span>
                     </div>
-                    <div className="text-[10px] text-slate-400 mt-1">Bot Trading Cash ➔ Live Fiat Vault</div>
+                    <div className="text-[10px] text-slate-400 mt-1">Bot Trading Cash ➔ Live USD Ledger (for withdrawal)</div>
                   </button>
                 </div>
 
@@ -1655,7 +1254,7 @@ This document certifies real-time clearing across banking rails.
                   <div className="flex gap-2 mb-2">
                     {[0.25, 0.5, 0.75, 1].map((pct) => {
                       const pool = botTransferDirection === 'TO_BOT' ? fiatAccount.availableBalance : botCash;
-                      const val = Math.floor(pool * pct);
+                      const val = Math.floor(pool * pct * 100) / 100;
                       return (
                         <button
                           key={pct}
@@ -1683,6 +1282,24 @@ This document certifies real-time clearing across banking rails.
                   </div>
                 </div>
 
+                {(transfer2FaNeeded || (parseFloat(botTransferAmount) || 0) >= 2000) && (
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 uppercase mb-1">
+                      6-digit 2FA Code (required for transfers ≥ $2,000)
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={6}
+                      value={transfer2FaCode}
+                      onChange={(e) => setTransfer2FaCode(e.target.value.replace(/\D/g, ''))}
+                      placeholder="123456"
+                      className="w-40 bg-slate-900 border border-slate-700 text-white px-3 py-2 rounded-lg font-mono text-sm focus:outline-none focus:border-cyan-500"
+                    />
+                  </div>
+                )}
+
                 <button
                   type="submit"
                   disabled={isLoading}
@@ -1690,7 +1307,7 @@ This document certifies real-time clearing across banking rails.
                 >
                   <ArrowLeftRight className="h-4 w-4" />
                   <span>
-                    Execute Internal Transfer (${parseFloat(botTransferAmount || '0').toFixed(2)})
+                    Execute Ledger Transfer (${(parseFloat(botTransferAmount || '0') || 0).toFixed(2)})
                   </span>
                 </button>
               </form>
@@ -1704,14 +1321,14 @@ This document certifies real-time clearing across banking rails.
                 <div>
                   <h3 className="text-xs font-bold text-white flex items-center gap-1.5">
                     <Receipt className="h-4 w-4 text-cyan-400" />
-                    Immutable Proof-of-Reserves Activity Log
+                    USD Ledger Transaction Log
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    Cryptographically hashed records across FedNow, Visa Direct, and ACH banking rails.
+                    Recorded Stripe card payments, Plaid ACH bank transfers, Increase Check 21 deposits, PayPal payouts, and bot margin transfers.
                   </p>
                 </div>
                 <span className="font-mono text-xs text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 rounded-full self-start sm:self-auto">
-                  {transactions.length} Verified Entries
+                  {transactions.length} Entries
                 </span>
               </div>
 
@@ -1769,7 +1386,7 @@ This document certifies real-time clearing across banking rails.
                         : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-emerald-300'
                     }`}
                   >
-                    Deposits ({transactions.filter((t) => t.type.includes('DEPOSIT') || t.type.includes('LOAD')).length})
+                    Deposits ({transactions.filter((t) => t.type.includes('DEPOSIT') || t.type.includes('LOAD') || t.type === 'CRYPTO_LIQUIDATION').length})
                   </button>
                   <button
                     type="button"
@@ -1790,7 +1407,7 @@ This document certifies real-time clearing across banking rails.
                 {(() => {
                   const filtered = transactions.filter((tx) => {
                     if (ledgerFilter === 'WITHDRAW' && !tx.type.includes('WITHDRAW')) return false;
-                    if (ledgerFilter === 'DEPOSIT' && !(tx.type.includes('DEPOSIT') || tx.type.includes('LOAD'))) return false;
+                    if (ledgerFilter === 'DEPOSIT' && !(tx.type.includes('DEPOSIT') || tx.type.includes('LOAD') || tx.type === 'CRYPTO_LIQUIDATION')) return false;
                     if (ledgerFilter === 'BOT_TRANSFER' && !tx.type.includes('BOT')) return false;
                     if (ledgerSearch.trim()) {
                       const q = ledgerSearch.toLowerCase();
@@ -1818,7 +1435,7 @@ This document certifies real-time clearing across banking rails.
                     >
                       <div className="flex items-center gap-3">
                         <div className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-cyan-400">
-                          {tx.type.includes('DEPOSIT') || tx.type.includes('LOAD') ? (
+                          {tx.type.includes('DEPOSIT') || tx.type.includes('LOAD') || tx.type === 'CRYPTO_LIQUIDATION' ? (
                             <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
                           ) : (
                             <ArrowUpFromLine className="h-4 w-4 text-cyan-400" />
@@ -1867,7 +1484,15 @@ This document certifies real-time clearing across banking rails.
                           {tx.type.includes('WITHDRAW') ? '-' : '+'}
                           {formatCurrency(tx.amount)}
                         </div>
-                        <span className="text-[9px] text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                        <span
+                          className={`text-[9px] px-1.5 py-0.5 rounded ${
+                            tx.status === 'COMPLETED'
+                              ? 'text-emerald-400 bg-emerald-500/10'
+                              : tx.status === 'FAILED'
+                              ? 'text-rose-400 bg-rose-500/10'
+                              : 'text-amber-400 bg-amber-500/10'
+                          }`}
+                        >
                           {tx.status}
                         </span>
                       </div>
@@ -1879,12 +1504,12 @@ This document certifies real-time clearing across banking rails.
           )}
         </div>
 
-        {/* Footer Security Badge */}
+        {/* Footer Settlement Rail Note */}
         <div className="px-6 py-3 bg-slate-950/80 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-400">
           <div className="flex items-center gap-3">
             <span className="flex items-center gap-1 text-slate-300">
               <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-              <span>Custodial Trust Partner: Cross River / Evolve Bank & Trust (Member FDIC)</span>
+              <span>Live Settlement Rails: Stripe (Card &amp; ACH) · Increase Check 21 · PayPal Payouts · Encrypted Ledger</span>
             </span>
           </div>
           <div className="font-mono text-[10px] text-slate-500">
@@ -1892,19 +1517,6 @@ This document certifies real-time clearing across banking rails.
           </div>
         </div>
       </div>
-
-      {/* 3D Secure 2.2 Strong Customer Authentication Modal */}
-      <ThreeDSecureModal
-        isOpen={is3DsModalOpen}
-        session={active3DsSession}
-        suggestedOtp={suggested3DsOtp}
-        onSuccess={handle3DsSuccess}
-        onCancel={() => {
-          setIs3DsModalOpen(false);
-          setActive3DsSession(null);
-          showFeedback('error', '3D Secure transfer approval was cancelled.');
-        }}
-      />
     </div>
   );
 };
