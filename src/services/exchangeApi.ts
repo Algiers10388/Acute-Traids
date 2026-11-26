@@ -139,6 +139,12 @@ export interface VaultChainBalances {
   chainIdHex: string;
   explorer: string;
   vaultAddress: string;
+  isSmartContract?: boolean;
+  contractOwner?: string | null;
+  canContractRescue?: boolean;
+  hasRescueTokensTo?: boolean;
+  hasDirectFlashArb?: boolean;
+  knownContractForChain?: string | null;
   profitVaultDefault: string;
   gasWalletDefault: string | null;
   hasServerSignerForVault: boolean;
@@ -301,5 +307,262 @@ export async function confirmVaultTransferTx(payload: {
   });
   return parseApiJson(res, 'Could not confirm transaction on-chain');
 }
+export interface VaultSignerGasInfo {
+  success: boolean;
+  chain: string;
+  chainName: string;
+  chainId: number;
+  chainIdHex: string;
+  explorer: string;
+  nativeSymbol: string;
+  signerAddress: string;
+  balanceWei: string;
+  balanceFormatted: string;
+  gasPriceGwei: string;
+  recommendedTopUp: string;
+  hasServerFundingSigner: boolean;
+  serverSignerAddress: string | null;
+  serverSignerBalanceFormatted: string;
+  canServerFund: boolean;
+  timestamp: number;
+}
 
+export async function resolveVaultSignerInfo(payload: {
+  chain: string;
+  signerAddress?: string;
+  privateKey?: string;
+  passphrase?: string;
+}): Promise<VaultSignerGasInfo> {
+  const res = await fetch('/api/flash-arb/vault/resolve-signer-info', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Failed to resolve signer gas balance');
+}
+
+export async function fundVaultSignerGas(payload: {
+  chain: string;
+  targetAddress: string;
+  amount: string;
+}): Promise<{
+  success: boolean;
+  chain: string;
+  chainName: string;
+  from: string;
+  to: string;
+  asset: string;
+  amount: string;
+  txHash: string;
+  blockNumber: number;
+  explorerUrl: string;
+  message: string;
+}> {
+  const res = await fetch('/api/flash-arb/vault/fund-signer-gas', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Failed to fund gas from server Gas Wallet');
+}
+
+export interface ContractRescueFunctionItem {
+  name: string;
+  signature: string;
+  selector: string;
+  source: 'ABI' | 'BYTECODE';
+  paramTypes: string[];
+  paramRoles: Array<'TOKEN' | 'RECIPIENT' | 'AMOUNT' | 'OTHER'>;
+  directToRecipient: boolean;
+  supportsToken: boolean;
+  supportsNative: boolean;
+  requiresOwnerFollowUpTransfer: boolean;
+  encodable: boolean;
+  priorityScore: number;
+}
+
+export interface ContractRescueStepItem {
+  id: string;
+  stepIndex: number;
+  actionType: 'CONTRACT_RESCUE_DIRECT' | 'CONTRACT_RESCUE_TO_OWNER' | 'OWNER_FORWARD_TRANSFER';
+  functionName: string;
+  functionSignature: string;
+  selector: string;
+  tokenSymbol: string;
+  tokenAddress: string | null;
+  amountWei: string;
+  amountFormatted: string;
+  usdValue: number | null;
+  targetContract: string;
+  from: string;
+  to: string;
+  recipient: string;
+  calldata: string;
+  estimatedGasUnits: string;
+  estimatedGasCostWei: string;
+  estimatedGasCostEth: string;
+  estimatedGasCostUsd: number | null;
+  singleTxToProfitVault: boolean;
+  status: 'PLANNED' | 'SKIPPED_DUST' | 'UNSUPPORTED_ASSET' | 'SIMULATION_FAILED';
+  reason?: string;
+}
+
+export interface ContractRescueScanResult {
+  success: boolean;
+  chain: string;
+  chainName: string;
+  chainId: number;
+  chainIdHex: string;
+  explorer: string;
+  rpcUsed: string;
+  nativeSymbol: string;
+  contractAddress: string;
+  destinationWallet: string;
+  isProfitVaultDefault: boolean;
+  contractOwner: string | null;
+  ownerSource: string | null;
+  ownershipProbes: Array<{
+    getter: string;
+    selector: string;
+    ownerAddress: string | null;
+  }>;
+  ownerGasBalanceWei: string;
+  ownerGasBalanceFormatted: string;
+  hasSufficientOwnerGas: boolean;
+  hasMatchingServerSigner: boolean;
+  serverSignerAddress: string | null;
+  abiSource: 'USER_PROVIDED' | 'ETHERSCAN_VERIFIED' | 'BYTECODE_ONLY';
+  abiFetchNote: string | null;
+  detectedFunctions: ContractRescueFunctionItem[];
+  trappedAssets: Array<{
+    symbol: string;
+    address: string | null;
+    decimals: number;
+    rawBalance: string;
+    formattedBalance: string;
+    usdValue: number | null;
+    isNative: boolean;
+  }>;
+  optimalGas: {
+    baseFeeGwei: string | null;
+    maxFeePerGasWei: string;
+    maxFeePerGasGwei: string;
+    maxPriorityFeePerGasWei: string;
+    maxPriorityFeePerGasGwei: string;
+  };
+  plan: {
+    contractAddress: string;
+    contractOwner: string | null;
+    profitWallet: string;
+    gasOptimizationStrategy: string;
+    executableSteps: ContractRescueStepItem[];
+    skippedSteps: ContractRescueStepItem[];
+    totalEstimatedGasUnits: string;
+    totalEstimatedGasCostWei: string;
+    totalEstimatedGasCostEth: string;
+    totalEstimatedGasCostUsd: number | null;
+    totalRecoverableUsd: number;
+    gasSavedByDirectCallUnits: string;
+  };
+  timestamp: number;
+}
+
+export interface ContractRescueExecuteResult {
+  success: boolean;
+  mode: 'BROADCASTED' | 'UNSIGNED_TX';
+  requiresWalletSigning?: boolean;
+  signerRequired?: string;
+  chain: string;
+  chainName: string;
+  contractAddress: string;
+  contractOwner: string;
+  destinationWallet: string;
+  executedTxs?: Array<{
+    stepIndex: number;
+    actionType: string;
+    functionSignature: string;
+    tokenSymbol: string;
+    amountFormatted: string;
+    txHash: string;
+    blockNumber: number;
+    gasUsed: string;
+    explorerUrl: string;
+  }>;
+  unsignedTxs?: Array<{
+    stepIndex: number;
+    actionType: string;
+    functionSignature: string;
+    tokenSymbol: string;
+    amountFormatted: string;
+    from: string;
+    to: string;
+    value: string;
+    data: string;
+    gas: string;
+    maxFeePerGas: string;
+    maxPriorityFeePerGas: string;
+    chainId: number;
+    chainIdHex: string;
+  }>;
+  scan: ContractRescueScanResult;
+  message: string;
+}
+
+export async function scanContractRescueAgent(payload: {
+  chain: string;
+  contractAddress?: string;
+  destinationWallet?: string;
+  abi?: string;
+  extraTokens?: string[];
+  skipGasNegativeDust?: boolean;
+}): Promise<ContractRescueScanResult> {
+  const res = await fetch('/api/flash-arb/contract-rescue-agent/scan', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Automated contract rescue scan failed');
+}
+
+export async function executeContractRescueAgent(payload: {
+  chain: string;
+  contractAddress?: string;
+  destinationWallet?: string;
+  abi?: string;
+  extraTokens?: string[];
+  skipGasNegativeDust?: boolean;
+  privateKey?: string;
+  passphrase?: string;
+}): Promise<ContractRescueExecuteResult> {
+  const res = await fetch('/api/flash-arb/contract-rescue-agent/execute', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Automated contract rescue execution failed');
+}
+
+export async function confirmContractRescueTx(payload: {
+  chain: string;
+  txHash: string;
+}): Promise<{
+  success: boolean;
+  txHash: string;
+  blockNumber: number;
+  gasUsed: string;
+  explorerUrl: string;
+  message: string;
+}> {
+  const res = await fetch('/api/flash-arb/contract-rescue-agent/confirm', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return parseApiJson(res, 'Could not confirm recovery transaction');
+}
 

@@ -71,6 +71,8 @@ import {
   encodeRescueTokens,
   encodeRescueTokensTo,
   encodeErc20Transfer,
+  encodeErc20Allowance,
+  resolveVaultTransferExecutionPlan,
   encodeErc721SafeTransferFrom,
   encodeErc1155SafeTransferFrom,
   parseExtraTokenSpec,
@@ -112,6 +114,17 @@ import {
   normalizeTokenSymbolFilter,
   filterSweepTokensBySymbols,
 } from '../src/utils/usdtAutoSweep.ts';
+import { etherscanApi, isEtherscanKeyConfigured } from './etherscanService.ts';
+import {
+  OWNER_GETTER_PROBES,
+  decodeAddressReturn,
+  detectBytecodeRescueSweepFunctions,
+  inspectAbiForRescueSweep,
+  mergeDetectedRescueSweepFunctions,
+  planGasOptimizedRecovery,
+  type RescueSweepFunctionSpec,
+  type TrappedAssetCandidate,
+} from './contractRescueAgent.ts';
 
 export const flashArbRouter = Router();
 
@@ -668,6 +681,18 @@ async function broadcastSignedTxAndWait(params: {
     valueWei,
     urgencyMultiplierPct: params.urgencyMultiplierPct ?? (c === 'ethereum' ? 125 : 110),
   });
+
+  const effectiveMinGasPrice =
+    baseFeeWei && baseFeeWei > 0n
+      ? baseFeeWei + feeParams.maxPriorityFeePerGas
+      : feeParams.gasPrice;
+  const minRequiredForTxWei = valueWei + gasLimit * effectiveMinGasPrice;
+  const strictFloorGasCostWei = gasLimit * (baseFeeWei && baseFeeWei > 0n ? baseFeeWei : rpcGasPriceWei || 1n);
+  if (balanceWei === 0n || balanceWei < valueWei + strictFloorGasCostWei) {
+    throw new Error(
+      `Signer wallet ${signerAddress} holds ${ethers.formatEther(balanceWei)} ${rpcInfo.nativeSymbol} on ${rpcInfo.name}, which is insufficient for value + gas (~${ethers.formatEther(minRequiredForTxWei)} ${rpcInfo.nativeSymbol}). Destination wallets cannot pay sender gas in EVM.`
+    );
+  }
 
   const signTxWithFees = async (fees: ReturnType<typeof computeOptimalFeeParams>) => {
     const wallet = new ethers.Wallet(normalizedKey);
@@ -7494,10 +7519,41 @@ flashArbRouter.get('/vault/balances', async (req: Request, res: Response) => {
       typeof req.query.extraTokens === 'string' ? req.query.extraTokens.split(',') : []
     );
 
-    const balInfo = await queryAllChainBalances(chain, vaultAddress, extraTokens);
+    const [balInfo, vaultCodeResp] = await Promise.all([
+      queryAllChainBalances(chain, vaultAddress, extraTokens),
+      fetchRpcSingleWithFailover(chain, 'eth_getCode', [vaultAddress, 'latest'], true).catch(() => ({ result: '0x' })),
+    ]);
+    const codeHex = typeof vaultCodeResp?.result === 'string' ? vaultCodeResp.result : '0x';
+    const isSmartContract = codeHex !== '0x' && codeHex.length > 2;
+    const codeLower = codeHex.toLowerCase();
+    const directFlashSelector = ethers.id('executeDirectFlashArb(address)').slice(2, 10).toLowerCase();
+    const hasRescueTokensTo = isSmartContract && codeLower.includes('a7070692');
+    const hasDirectFlashArb = isSmartContract && codeLower.includes(directFlashSelector);
+    let contractOwner: string | null = null;
+    if (isSmartContract && (hasRescueTokensTo || hasDirectFlashArb)) {
+      try {
+        const ownerResp = await fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ to: vaultAddress, data: '0x8da5cb5b' }, 'latest'],
+          true
+        );
+        if (typeof ownerResp?.result === 'string' && ownerResp.result.startsWith('0x') && ownerResp.result.length >= 66) {
+          contractOwner = normalizeValidContractAddress(`0x${ownerResp.result.slice(-40)}`);
+        }
+      } catch {
+        contractOwner = null;
+      }
+    }
+    const knownContractForChain =
+      normalizeValidContractAddress(DEPLOYED_CONTRACTS[chain] || '') ||
+      (KNOWN_FLASH_ARB_CONTRACTS[chain] || [])[0] ||
+      null;
     const resolvedSigner = resolveServerSigner();
     const hasServerSignerForVault = Boolean(
-      resolvedSigner.ok && resolvedSigner.address.toLowerCase() === vaultAddress.toLowerCase()
+      resolvedSigner.ok &&
+        (resolvedSigner.address.toLowerCase() === vaultAddress.toLowerCase() ||
+          (contractOwner && resolvedSigner.address.toLowerCase() === contractOwner.toLowerCase()))
     );
 
     const erc20Holdings = balInfo.tokens
@@ -7528,6 +7584,12 @@ flashArbRouter.get('/vault/balances', async (req: Request, res: Response) => {
       chainIdHex: CHAIN_ID_HEX_MAP[chain],
       explorer: rpcInfo.explorer,
       vaultAddress,
+      isSmartContract,
+      contractOwner,
+      canContractRescue: Boolean(isSmartContract && contractOwner && (hasRescueTokensTo || hasDirectFlashArb)),
+      hasRescueTokensTo,
+      hasDirectFlashArb,
+      knownContractForChain,
       profitVaultDefault: profitWalletEnv(),
       gasWalletDefault: gasWalletEnv() || null,
       hasServerSignerForVault,
@@ -7623,17 +7685,51 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
       activeSigner = { address: parsed.address, privateKey: parsed.privateKey, wallet: parsed.wallet } as any;
     } else {
       const serverSigner = resolveServerSigner();
-      if (serverSigner.ok) {
+      if (serverSigner.ok && serverSigner.address.toLowerCase() === sourceVaultAddress.toLowerCase()) {
         activeSigner = { address: serverSigner.address, privateKey: serverSigner.privateKey, wallet: serverSigner.wallet } as any;
       }
     }
 
-    // Fetch live on-chain balances + gas price via RPC pool
+    // Fetch live on-chain balances + gas price + contract code (+ signer ETH balance if distinct) via RPC pool
     const extraSpecs = rawTokenAddress ? [rawTokenAddress] : [];
-    const [balInfo, gasPriceResp] = await Promise.all([
+    const needsSeparateSignerBal = Boolean(
+      activeSigner && activeSigner.address.toLowerCase() !== sourceVaultAddress.toLowerCase()
+    );
+    const [balInfo, gasPriceResp, vaultCodeResp, signerBalResp] = await Promise.all([
       queryAllChainBalances(chain, sourceVaultAddress, extraSpecs),
       fetchRpcSingleWithFailover(chain, 'eth_gasPrice', [], true),
+      fetchRpcSingleWithFailover(chain, 'eth_getCode', [sourceVaultAddress, 'latest'], true).catch(() => ({ result: '0x' })),
+      needsSeparateSignerBal && activeSigner
+        ? fetchRpcSingleWithFailover(chain, 'eth_getBalance', [activeSigner.address, 'latest'], true).catch(() => ({ result: '0x0' }))
+        : Promise.resolve({ result: null }),
     ]);
+    const codeHex = typeof vaultCodeResp?.result === 'string' ? vaultCodeResp.result : '0x';
+    const isSourceContract = codeHex !== '0x' && codeHex.length > 2;
+    const codeLower = codeHex.toLowerCase();
+    const directFlashSelector = ethers.id('executeDirectFlashArb(address)').slice(2, 10).toLowerCase();
+    const hasRescueTokensTo = isSourceContract && codeLower.includes('a7070692');
+    const hasDirectFlashArb = isSourceContract && codeLower.includes(directFlashSelector);
+    let contractOwner: string | null = null;
+    if (isSourceContract && (hasRescueTokensTo || hasDirectFlashArb)) {
+      try {
+        const ownerResp = await fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ to: sourceVaultAddress, data: '0x8da5cb5b' }, 'latest'],
+          true
+        );
+        if (typeof ownerResp?.result === 'string' && ownerResp.result.startsWith('0x') && ownerResp.result.length >= 66) {
+          contractOwner = normalizeValidContractAddress(`0x${ownerResp.result.slice(-40)}`);
+        }
+      } catch {
+        contractOwner = null;
+      }
+    }
+    const signerEthWei = needsSeparateSignerBal
+      ? typeof signerBalResp?.result === 'string' && signerBalResp.result.startsWith('0x')
+        ? BigInt(signerBalResp.result)
+        : 0n
+      : balInfo.ethWei;
     const gasPriceWei =
       typeof gasPriceResp?.result === 'string' && gasPriceResp.result.startsWith('0x')
         ? BigInt(gasPriceResp.result)
@@ -7649,15 +7745,66 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         });
       }
 
-      let estGas = 21_000n;
-      let gasLimit = 26_250n; // safe margin for L1/L2 intrinsic + calldata-free send
-      if (!isMax) {
+      const nativePlan = resolveVaultTransferExecutionPlan({
+        isNativeTransfer: true,
+        sourceVaultAddress,
+        depositAddress,
+        activeSignerAddress: activeSigner?.address ?? null,
+        isSourceContract,
+        assetSymbol: chainMeta.nativeSymbol,
+        amountWei: 0n,
+        rawBalanceWei: balInfo.ethWei,
+        formattedBalance: balInfo.ethFormatted,
+        contractOwner,
+        hasRescueTokensTo,
+        hasDirectFlashArb,
+      });
+      if (!nativePlan.ok) {
+        return res.status(400).json({
+          success: false,
+          error: nativePlan.error,
+          signerAddress: activeSigner?.address,
+          signerMismatch: nativePlan.signerMismatch,
+          isSmartContract: isSourceContract,
+          contractOwner,
+        });
+      }
+
+      // If Web3 unsigned tx is rescuing from a contract, query live owner gas balance
+      let effectiveOwnerGasWei = signerEthWei;
+      if (nativePlan.usesContractRescue && !activeSigner && contractOwner) {
         try {
-          const probeWei = ethers.parseEther(rawAmountStr);
+          const ownerBal = await fetchRpcSingleWithFailover(
+            chain,
+            'eth_getBalance',
+            [contractOwner, 'latest'],
+            true
+          );
+          if (typeof ownerBal?.result === 'string' && ownerBal.result.startsWith('0x')) {
+            effectiveOwnerGasWei = BigInt(ownerBal.result);
+          }
+        } catch {
+          effectiveOwnerGasWei = balInfo.ethWei;
+        }
+      }
+
+      let estGas = nativePlan.usesContractRescue ? 95_000n : 21_000n;
+      let gasLimit = nativePlan.usesContractRescue ? 130_000n : 26_250n;
+      if (!isMax || nativePlan.usesContractRescue) {
+        try {
+          const probeWei = isMax || nativePlan.usesContractRescue ? 0n : ethers.parseEther(rawAmountStr);
           const { result: estHex } = await fetchRpcSingleWithFailover(
             chain,
             'eth_estimateGas',
-            [{ from: sourceVaultAddress, to: depositAddress, value: `0x${probeWei.toString(16)}` }, 'latest'],
+            [
+              {
+                from: nativePlan.effectiveSender,
+                to: nativePlan.callTarget,
+                value: `0x${(nativePlan.usesContractRescue ? 0n : probeWei).toString(16)}`,
+                ...(nativePlan.calldata !== '0x' ? { data: nativePlan.calldata } : {}),
+              },
+              'latest',
+            ],
             true
           );
           if (typeof estHex === 'string' && estHex.startsWith('0x')) {
@@ -7667,14 +7814,28 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
               gasLimit = (estGas * 125n) / 100n;
             }
           }
-        } catch {
-          // Keep 26,250 gas fallback for plain EOA transfer
+        } catch (simErr: any) {
+          if (/revert|insufficient|execution reverted/i.test(String(simErr?.message || ''))) {
+            return res.status(400).json({
+              success: false,
+              error: `Native transfer pre-flight simulation reverted on ${rpcInfo.name} (0 gas spent): ${decodeFlashArbRevertError(simErr)}`,
+            });
+          }
         }
       }
 
       const estimatedGasFeeWei = gasLimit * gasPriceWei;
       let valueWei: bigint;
-      if (isMax) {
+      if (nativePlan.usesContractRescue) {
+        if (effectiveOwnerGasWei < estimatedGasFeeWei) {
+          return res.status(400).json({
+            success: false,
+            error: `Owner signer ${nativePlan.effectiveSender} needs ~${ethers.formatEther(estimatedGasFeeWei)} ${chainMeta.nativeSymbol} for gas to rescue funds from contract ${sourceVaultAddress}.`,
+            signerAddress: nativePlan.effectiveSender,
+          });
+        }
+        valueWei = balInfo.ethWei;
+      } else if (isMax) {
         valueWei = balInfo.ethWei - estimatedGasFeeWei;
         if (valueWei <= 0n) {
           return res.status(400).json({
@@ -7691,10 +7852,10 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         if (valueWei <= 0n) {
           return res.status(400).json({ success: false, error: 'Transfer amount must be greater than zero.' });
         }
-        if (valueWei + estimatedGasFeeWei > balInfo.ethWei) {
+        if (valueWei + estimatedGasFeeWei > effectiveOwnerGasWei) {
           return res.status(400).json({
             success: false,
-            error: `Insufficient ${chainMeta.nativeSymbol} on ${rpcInfo.name}: balance ${balInfo.ethFormatted}, need ${ethers.formatEther(valueWei)} + ~${ethers.formatEther(estimatedGasFeeWei)} gas.`,
+            error: `Insufficient ${chainMeta.nativeSymbol} on ${rpcInfo.name}: balance ${ethers.formatEther(effectiveOwnerGasWei)}, need ${ethers.formatEther(valueWei)} + ~${ethers.formatEther(estimatedGasFeeWei)} gas.`,
           });
         }
       }
@@ -7710,8 +7871,9 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
           const sent = await broadcastSignedTxAndWait({
             chain,
             cleanKey: activeSigner.privateKey,
-            to: depositAddress,
-            valueWei,
+            to: nativePlan.callTarget,
+            valueWei: nativePlan.usesContractRescue ? 0n : valueWei,
+            ...(nativePlan.calldata !== '0x' ? { data: nativePlan.calldata } : {}),
             gasLimit,
             allowAutoSpeedUp: true,
             urgencyMultiplierPct: chain === 'ethereum' ? 150 : 115,
@@ -7727,6 +7889,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
           }
           txHash = sent.txHash;
           blockNumber = sent.receipt.blockNumber;
+          gasUsed = sent.receipt.gasUsed.toString();
         } catch (broadcastErr: any) {
           return res.status(400).json({
             success: false,
@@ -7749,7 +7912,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
           destination: `${exchange} (${depositAddress})`,
           status: 'COMPLETED',
           txHash,
-          executionNote: `Vault ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)} -> ${exchange} on ${rpcInfo.name} (authorized by ${activeSigner.address.slice(0, 6)}...${activeSigner.address.slice(-4)})`,
+          executionNote: `Vault ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)} -> ${exchange} via ${nativePlan.methodLabel} on ${rpcInfo.name} (authorized by ${activeSigner.address.slice(0, 6)}...${activeSigner.address.slice(-4)})`,
         });
 
         return res.json({
@@ -7775,7 +7938,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         success: true,
         mode: 'UNSIGNED_TX',
         requiresWalletSigning: true,
-        signerRequired: sourceVaultAddress,
+        signerRequired: nativePlan.effectiveSender,
         chain,
         chainName: rpcInfo.name,
         exchange,
@@ -7784,15 +7947,15 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         asset: chainMeta.nativeSymbol,
         amount: sendAmountFormatted,
         unsignedTx: {
-          from: sourceVaultAddress,
-          to: depositAddress,
-          value: `0x${valueWei.toString(16)}`,
-          data: '0x',
+          from: nativePlan.effectiveSender,
+          to: nativePlan.callTarget,
+          value: nativePlan.usesContractRescue ? '0x0' : `0x${valueWei.toString(16)}`,
+          data: nativePlan.calldata,
           gas: `0x${gasLimit.toString(16)}`,
           chainId: rpcInfo.chainId,
           chainIdHex: CHAIN_ID_HEX_MAP[chain],
         },
-        message: `Prepared ${Number(sendAmountFormatted).toFixed(6)} ${chainMeta.nativeSymbol} Vault -> ${exchange} transfer for Web3 wallet signature from ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)}.`,
+        message: `Prepared ${Number(sendAmountFormatted).toFixed(6)} ${chainMeta.nativeSymbol} Vault -> ${exchange} transfer (${nativePlan.methodLabel}) for Web3 wallet signature from ${nativePlan.effectiveSender.slice(0, 6)}...${nativePlan.effectiveSender.slice(-4)}.`,
       });
     }
 
@@ -7844,32 +8007,113 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
       }
     }
 
-    const calldata = encodeErc20Transfer(depositAddress, amountWei);
+    let allowanceWei = 0n;
+    if (activeSigner && activeSigner.address.toLowerCase() !== sourceVaultAddress.toLowerCase()) {
+      try {
+        const allowanceResp = await fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ to: tok.address, data: encodeErc20Allowance(sourceVaultAddress, activeSigner.address) }, 'latest'],
+          true
+        );
+        if (typeof allowanceResp?.result === 'string' && allowanceResp.result.startsWith('0x') && allowanceResp.result.length >= 66) {
+          allowanceWei = BigInt(allowanceResp.result);
+        }
+      } catch {
+        allowanceWei = 0n;
+      }
+    }
+
+    const erc20Plan = resolveVaultTransferExecutionPlan({
+      isNativeTransfer: false,
+      sourceVaultAddress,
+      depositAddress,
+      activeSignerAddress: activeSigner?.address ?? null,
+      isSourceContract,
+      assetSymbol: tok.symbol,
+      amountWei,
+      rawBalanceWei: tok.rawBalance,
+      formattedBalance: tok.formatted,
+      tokenAddress: tok.address,
+      allowanceWei,
+      formattedAllowance: ethers.formatUnits(allowanceWei, tok.decimals),
+      contractOwner,
+      hasRescueTokensTo,
+      hasDirectFlashArb,
+    });
+    if (!erc20Plan.ok) {
+      return res.status(400).json({
+        success: false,
+        error: erc20Plan.error,
+        signerAddress: activeSigner?.address,
+        signerMismatch: erc20Plan.signerMismatch,
+        isSmartContract: isSourceContract,
+        contractOwner,
+      });
+    }
+
+    const calldata = erc20Plan.calldata;
+    const effectiveSender = erc20Plan.effectiveSender;
+    const callTarget = erc20Plan.callTarget;
+
+    // For Web3 unsigned contract rescue, check owner's ETH gas balance directly
+    let effectiveGasBalWei = signerEthWei;
+    if (erc20Plan.usesContractRescue && !activeSigner && contractOwner) {
+      try {
+        const ownerBalResp = await fetchRpcSingleWithFailover(chain, 'eth_getBalance', [contractOwner, 'latest'], true);
+        if (typeof ownerBalResp?.result === 'string' && ownerBalResp.result.startsWith('0x')) {
+          effectiveGasBalWei = BigInt(ownerBalResp.result);
+        }
+      } catch {
+        effectiveGasBalWei = signerEthWei;
+      }
+    }
+
     let estGas = 85_000n;
     try {
-      const { result: estHex } = await fetchRpcSingleWithFailover(
-        chain,
-        'eth_estimateGas',
-        [{ from: sourceVaultAddress, to: tok.address, data: calldata }, 'latest'],
-        true
-      );
-      if (typeof estHex === 'string' && estHex.startsWith('0x')) {
-        const parsedEst = BigInt(estHex);
+      const [simCallResp, estResp] = await Promise.all([
+        fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ from: effectiveSender, to: callTarget, data: calldata }, 'latest'],
+          true
+        ),
+        fetchRpcSingleWithFailover(
+          chain,
+          'eth_estimateGas',
+          [{ from: effectiveSender, to: callTarget, data: calldata }, 'latest'],
+          true
+        ),
+      ]);
+      if (
+        !erc20Plan.usesContractRescue &&
+        typeof simCallResp?.result === 'string' &&
+        simCallResp.result !== '0x' &&
+        /^0x0+$/.test(simCallResp.result)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `ERC-20 ${erc20Plan.usesTransferFrom ? 'transferFrom' : 'transfer'} returned false during pre-flight simulation on ${rpcInfo.name} (0 gas spent).`,
+        });
+      }
+      if (typeof estResp?.result === 'string' && estResp.result.startsWith('0x')) {
+        const parsedEst = BigInt(estResp.result);
         if (parsedEst > 0n) estGas = parsedEst;
       }
     } catch (simErr: any) {
       return res.status(400).json({
         success: false,
-        error: `ERC-20 transfer pre-flight simulation reverted on ${rpcInfo.name}: ${decodeFlashArbRevertError(simErr)}`,
+        error: `ERC-20 transfer pre-flight simulation reverted on ${rpcInfo.name} (0 gas spent): ${decodeFlashArbRevertError(simErr)}`,
       });
     }
 
     const gasLimit = (estGas * 130n) / 100n;
     const neededGasWei = gasLimit * gasPriceWei;
-    if (balInfo.ethWei < neededGasWei) {
+    if (effectiveGasBalWei < neededGasWei) {
       return res.status(400).json({
         success: false,
-        error: `Vault ${sourceVaultAddress} needs ~${ethers.formatEther(neededGasWei)} ${chainMeta.nativeSymbol} for gas on ${rpcInfo.name} to transfer ${tok.symbol} (current gas balance: ${balInfo.ethFormatted}).`,
+        error: `Signer ${effectiveSender} needs ~${ethers.formatEther(neededGasWei)} ${chainMeta.nativeSymbol} for gas on ${rpcInfo.name} to transfer ${tok.symbol} (current gas balance: ${ethers.formatEther(effectiveGasBalWei)} ${chainMeta.nativeSymbol}).`,
+        signerAddress: effectiveSender,
       });
     }
 
@@ -7884,7 +8128,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         const sent = await broadcastSignedTxAndWait({
           chain,
           cleanKey: activeSigner.privateKey,
-          to: tok.address,
+          to: callTarget,
           data: calldata,
           gasLimit,
           allowAutoSpeedUp: true,
@@ -7924,7 +8168,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
         destination: `${exchange} (${depositAddress})`,
         status: 'COMPLETED',
         txHash,
-        executionNote: `Vault ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)} -> ${exchange} on ${rpcInfo.name} (authorized by ${activeSigner.address.slice(0, 6)}...${activeSigner.address.slice(-4)})`,
+        executionNote: `Vault ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)} -> ${exchange} via ${erc20Plan.methodLabel} on ${rpcInfo.name} (authorized by ${activeSigner.address.slice(0, 6)}...${activeSigner.address.slice(-4)})`,
       });
 
       return res.json({
@@ -7951,7 +8195,7 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
       success: true,
       mode: 'UNSIGNED_TX',
       requiresWalletSigning: true,
-      signerRequired: sourceVaultAddress,
+      signerRequired: effectiveSender,
       chain,
       chainName: rpcInfo.name,
       exchange,
@@ -7961,15 +8205,15 @@ flashArbRouter.post('/vault/transfer-to-exchange', async (req: Request, res: Res
       tokenAddress: tok.address,
       amount: sendAmountFormatted,
       unsignedTx: {
-        from: sourceVaultAddress,
-        to: tok.address,
+        from: effectiveSender,
+        to: callTarget,
         value: '0x0',
         data: calldata,
         gas: `0x${gasLimit.toString(16)}`,
         chainId: rpcInfo.chainId,
         chainIdHex: CHAIN_ID_HEX_MAP[chain],
       },
-      message: `Prepared ${sendAmountFormatted} ${tok.symbol} Vault -> ${exchange} transfer for Web3 wallet signature from ${sourceVaultAddress.slice(0, 6)}...${sourceVaultAddress.slice(-4)}.`,
+      message: `Prepared ${sendAmountFormatted} ${tok.symbol} Vault -> ${exchange} transfer (${erc20Plan.methodLabel}) for Web3 wallet signature from ${effectiveSender.slice(0, 6)}...${effectiveSender.slice(-4)}.`,
     });
   } catch (err: any) {
     return res.status(err?.timedOut ? 504 : 500).json({
@@ -8023,14 +8267,16 @@ flashArbRouter.post('/vault/transfer-confirm', async (req: Request, res: Respons
       });
     }
 
-    // Verify tx sender on-chain matches expected sourceVaultAddress
+    // Verify tx sender or called rescue contract on-chain matches expected sourceVaultAddress
     try {
       const txLookup = await fetchRpcSingleWithFailover(chain, 'eth_getTransactionByHash', [txHash], true);
       const actualFrom = String(txLookup?.result?.from || '').toLowerCase();
-      if (actualFrom && actualFrom !== sourceVaultAddress.toLowerCase()) {
+      const actualTo = String(txLookup?.result?.to || '').toLowerCase();
+      const vaultLower = sourceVaultAddress.toLowerCase();
+      if (actualFrom && actualFrom !== vaultLower && actualTo !== vaultLower) {
         return res.status(400).json({
           success: false,
-          error: `Transaction sender ${actualFrom} does not match expected Vault ${sourceVaultAddress}.`,
+          error: `Transaction sender ${actualFrom} (target ${actualTo || 'none'}) does not match expected Vault ${sourceVaultAddress}.`,
         });
       }
     } catch {
@@ -8793,7 +9039,7 @@ flashArbRouter.post('/agent/rpc-sources/clear-cooldowns', (_req: Request, res: R
 const dualVenueAgentState: DualVenueAgentState = {
   enabled: false,
   agentState: 'IDLE',
-  minNetProfitUsd: 0.5,
+  minNetProfitUsd: 0.05,
   maxClipUsd: 25_000,
   allowFlashLoanFallback: true,
   lastRunAt: 0,
@@ -9057,6 +9303,254 @@ flashArbRouter.post('/vault/generate-temp-signer', (req: Request, res: Response)
 });
 
 /**
+ * GET /POST /api/flash-arb/gas-estimate
+ * Estimates current gas fees (eth_gasPrice, EIP-1559 baseFee, estimated cost in native token and USD)
+ * for a selected chain and gas limit, and returns warning flags if fees are high.
+ */
+async function handleGasEstimate(req: Request, res: Response) {
+  try {
+    const rawChain = String(req.query.chain || req.body?.chain || 'arbitrum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${rawChain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const chainMeta = CHAIN_LAYER_META[chain];
+    const gasLimit = BigInt(req.query.gasLimit || req.body?.gasLimit || 250_000n);
+
+    const [gasPriceResp, feeHistoryResp] = await Promise.all([
+      fetchRpcSingleWithFailover(chain, 'eth_gasPrice', [], true).catch(() => ({ result: null })),
+      fetchRpcSingleWithFailover(chain, 'eth_feeHistory', [0x1, 'latest', [50]], true).catch(() => ({ result: null })),
+    ]);
+
+    const gasPriceWei =
+      typeof gasPriceResp?.result === 'string' && gasPriceResp.result.startsWith('0x')
+        ? BigInt(gasPriceResp.result)
+        : 1_000_000_000n;
+
+    let baseFeeGwei: number | null = null;
+    try {
+      const hist = feeHistoryResp?.result;
+      if (hist && Array.isArray(hist.baseFeePerGas) && hist.baseFeePerGas.length > 0) {
+        const latestBaseFeeHex = hist.baseFeePerGas[hist.baseFeePerGas.length - 1];
+        if (typeof latestBaseFeeHex === 'string' && latestBaseFeeHex.startsWith('0x')) {
+          baseFeeGwei = Number(BigInt(latestBaseFeeHex)) / 1e9;
+        }
+      }
+    } catch {}
+
+    const gasPriceGwei = Number(gasPriceWei) / 1e9;
+    const nativeSymbol = chainMeta.nativeSymbol;
+    const nativePriceUsd = getLiveTokenUsdPrice(nativeSymbol, chain) || (nativeSymbol === 'ETH' ? 2500 : 1.0);
+
+    const estimatedGasFeeWei = gasLimit * gasPriceWei;
+    const estimatedGasFeeNative = ethers.formatEther(estimatedGasFeeWei);
+    const estimatedGasFeeUsd = Number((Number(estimatedGasFeeNative) * nativePriceUsd).toFixed(4));
+
+    const isL1 = chain === 'ethereum';
+    const highGasGweiThreshold = isL1 ? 80 : 30;
+    const highGasUsdThreshold = isL1 ? 15.0 : 2.0;
+
+    const highGasWarning = gasPriceGwei > highGasGweiThreshold || estimatedGasFeeUsd > highGasUsdThreshold;
+    let warningMessage: string | null = null;
+    if (highGasWarning) {
+      warningMessage = `High gas fee alert on ${chainMeta.shortName}: current gas price is ${gasPriceGwei.toFixed(2)} Gwei (est. cost $${estimatedGasFeeUsd.toFixed(2)}). Consider waiting for network congestion to clear before executing.`;
+    }
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: chainMeta.name,
+      nativeSymbol,
+      gasPriceGwei: Number(gasPriceGwei.toFixed(3)),
+      baseFeeGwei: baseFeeGwei !== null ? Number(baseFeeGwei.toFixed(3)) : null,
+      gasLimit: Number(gasLimit),
+      estimatedGasFeeWei: estimatedGasFeeWei.toString(),
+      estimatedGasFeeNative,
+      nativePriceUsd,
+      estimatedGasFeeUsd,
+      highGasWarning,
+      warningMessage,
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to estimate gas fees' });
+  }
+}
+
+flashArbRouter.get('/gas-estimate', handleGasEstimate);
+flashArbRouter.post('/gas-estimate', handleGasEstimate);
+
+/**
+ * POST /api/flash-arb/vault/resolve-signer-info
+ * Resolves a signer credential or address and returns its live on-chain native gas balance + recommended top-up.
+ */
+flashArbRouter.post('/vault/resolve-signer-info', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || 'ethereum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${req.body?.chain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.ethereum;
+    const chainMeta = CHAIN_LAYER_META[chain];
+
+    let signerAddress: string | null = normalizeValidContractAddress(req.body?.signerAddress);
+    const rawKey = typeof req.body?.privateKey === 'string' ? req.body.privateKey.trim() : '';
+    const rawPass = typeof req.body?.passphrase === 'string' ? req.body.passphrase : '';
+    const rawPath = typeof req.body?.derivationPath === 'string' ? req.body.derivationPath : '';
+
+    if (rawKey) {
+      const parsed = parseEvmPrivateKey(rawKey, {
+        passphrase: rawPass || undefined,
+        derivationPath: rawPath || undefined,
+      });
+      if (!parsed.ok) {
+        return res.status(400).json({ success: false, error: parsed.error });
+      }
+      signerAddress = parsed.address;
+    }
+
+    if (!signerAddress) {
+      return res.status(400).json({ success: false, error: 'Valid signerAddress or privateKey is required.' });
+    }
+
+    const serverSigner = resolveServerSigner();
+    const serverAddr = serverSigner.ok ? serverSigner.address : normalizeValidContractAddress(gasWalletEnv());
+
+    const [balResp, gasPriceResp, serverBalResp] = await Promise.all([
+      fetchRpcSingleWithFailover(chain, 'eth_getBalance', [signerAddress, 'latest'], true),
+      fetchRpcSingleWithFailover(chain, 'eth_gasPrice', [], true).catch(() => ({ result: null })),
+      serverAddr && serverAddr.toLowerCase() !== signerAddress.toLowerCase()
+        ? fetchRpcSingleWithFailover(chain, 'eth_getBalance', [serverAddr, 'latest'], true).catch(() => ({ result: null }))
+        : Promise.resolve({ result: null }),
+    ]);
+
+    const balanceWei = typeof balResp?.result === 'string' ? BigInt(balResp.result) : 0n;
+    const gasPriceWei =
+      typeof gasPriceResp?.result === 'string' && gasPriceResp.result.startsWith('0x')
+        ? BigInt(gasPriceResp.result)
+        : 1_000_000_000n;
+    const serverBalanceWei =
+      typeof serverBalResp?.result === 'string' && serverBalResp.result.startsWith('0x')
+        ? BigInt(serverBalResp.result)
+        : serverAddr && serverAddr.toLowerCase() === signerAddress.toLowerCase()
+          ? balanceWei
+          : 0n;
+
+    // Recommend enough gas for ~3 transfers (100k gas * 2x buffer), with sensible chain floor
+    const dynamicRecWei = gasPriceWei * 200_000n;
+    const floorRecWei = chain === 'ethereum' ? ethers.parseEther('0.002') : ethers.parseEther('0.0002');
+    const recommendedWei = dynamicRecWei > floorRecWei ? dynamicRecWei : floorRecWei;
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      chainId: rpcInfo.chainId,
+      chainIdHex: CHAIN_ID_HEX_MAP[chain],
+      explorer: rpcInfo.explorer,
+      nativeSymbol: chainMeta.nativeSymbol,
+      signerAddress,
+      balanceWei: balanceWei.toString(),
+      balanceFormatted: ethers.formatEther(balanceWei),
+      gasPriceGwei: Number(ethers.formatUnits(gasPriceWei, 'gwei')).toFixed(3),
+      recommendedTopUp: ethers.formatEther(recommendedWei),
+      hasServerFundingSigner: serverSigner.ok,
+      serverSignerAddress: serverAddr || null,
+      serverSignerBalanceFormatted: ethers.formatEther(serverBalanceWei),
+      canServerFund: Boolean(serverSigner.ok && serverBalanceWei > recommendedWei),
+      timestamp: Date.now(),
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to resolve signer gas balance.' });
+  }
+});
+
+/**
+ * POST /api/flash-arb/vault/fund-signer-gas
+ * Sends native gas coins on-chain from the configured server signer wallet (FLASH_ARB_SIGNER_KEY)
+ * to a target signer wallet so it can pay transaction fees.
+ */
+flashArbRouter.post('/vault/fund-signer-gas', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || 'ethereum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${req.body?.chain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.ethereum;
+    const chainMeta = CHAIN_LAYER_META[chain];
+
+    const targetAddress = normalizeValidContractAddress(req.body?.targetAddress);
+    if (!targetAddress) {
+      return res.status(400).json({ success: false, error: 'Valid non-zero targetAddress (0x...) is required.' });
+    }
+
+    const rawAmount = String(req.body?.amount ?? '').trim();
+    if (!rawAmount || !/^\d+(\.\d+)?$/.test(rawAmount) || Number(rawAmount) <= 0) {
+      return res.status(400).json({ success: false, error: 'Enter a valid positive gas amount.' });
+    }
+
+    const serverSigner = resolveServerSigner();
+    if (!serverSigner.ok) {
+      return res.status(400).json({
+        success: false,
+        error: 'Server funding key (FLASH_ARB_SIGNER_KEY) is not configured. Fund directly using MetaMask / Rabby or deposit from an exchange.',
+      });
+    }
+
+    if (serverSigner.address.toLowerCase() === targetAddress.toLowerCase()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Target address is already the server Gas Wallet.',
+      });
+    }
+
+    const valueWei = ethers.parseEther(rawAmount);
+    const { txHash, receipt } = await broadcastSignedTxAndWait({
+      chain,
+      cleanKey: serverSigner.privateKey,
+      to: targetAddress,
+      valueWei,
+      gasLimit: 26_250n,
+      allowAutoSpeedUp: true,
+      urgencyMultiplierPct: chain === 'ethereum' ? 140 : 115,
+      minBalanceWei: 0n,
+    });
+
+    if (receipt.status !== 1) {
+      return res.status(400).json({
+        success: false,
+        error: `Gas funding tx ${txHash} reverted on ${rpcInfo.name}.`,
+        txHash,
+        explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      });
+    }
+
+    invalidateBalanceResponseCaches(chain);
+
+    return res.json({
+      success: true,
+      chain,
+      chainName: rpcInfo.name,
+      from: serverSigner.address,
+      to: targetAddress,
+      asset: chainMeta.nativeSymbol,
+      amount: rawAmount,
+      txHash,
+      blockNumber: receipt.blockNumber,
+      explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      message: `Funded ${rawAmount} ${chainMeta.nativeSymbol} gas to ${targetAddress.slice(0, 6)}...${targetAddress.slice(-4)} on ${rpcInfo.name}.`,
+    });
+  } catch (err: any) {
+    return res.status(400).json({
+      success: false,
+      error: err?.message || 'Failed to fund gas from server Gas Wallet.',
+    });
+  }
+});
+
+/**
  * POST /api/flash-arb/cross-layer/execute
  * 1-Click execution of a two-venue corridor from the bottom L4 chart, routing spread profit into the Profit Vault.
  */
@@ -9079,6 +9573,662 @@ flashArbRouter.post('/cross-layer/execute', async (req: Request, res: Response) 
     return res.status(500).json({
       success: false,
       error: err?.message || '1-click dual-venue corridor execution failed',
+    });
+  }
+});
+
+// ============================================================
+// AUTOMATED CONTRACT RESCUE / SWEEP AGENT
+// ============================================================
+
+async function runContractRescueAgentScan(params: {
+  chain: SupportedArbChain;
+  contractAddress: string;
+  destinationWallet: string;
+  rawAbi?: unknown;
+  extraTokens?: Array<string | ExtraTokenSpec>;
+  skipGasNegativeDust?: boolean;
+}) {
+  const { chain, contractAddress, destinationWallet } = params;
+  const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.ethereum;
+  const chainMeta = CHAIN_LAYER_META[chain];
+
+  // 1. Fetch contract bytecode, owner getters, balances & fee data via live RPC
+  const batchCalls: any[] = [
+    { jsonrpc: '2.0', method: 'eth_getCode', params: [contractAddress, 'latest'], id: 1 },
+    { jsonrpc: '2.0', method: 'eth_gasPrice', params: [], id: 2 },
+    { jsonrpc: '2.0', method: 'eth_getBlockByNumber', params: ['latest', false], id: 3 },
+    { jsonrpc: '2.0', method: 'eth_maxPriorityFeePerGas', params: [], id: 4 },
+    ...OWNER_GETTER_PROBES.map((probe, idx) => ({
+      jsonrpc: '2.0',
+      method: 'eth_call',
+      params: [{ to: contractAddress, data: probe.selector }, 'latest'],
+      id: 10 + idx,
+    })),
+  ];
+
+  const [batchResp, balInfo] = await Promise.all([
+    fetchRpcBatchWithFailover(chain, batchCalls),
+    queryAllChainBalances(chain, contractAddress, params.extraTokens || []),
+  ]);
+
+  const byId = new Map<number, any>();
+  for (const r of batchResp.results) {
+    if (r && r.id !== undefined) byId.set(Number(r.id), r);
+  }
+
+  const codeHex = typeof byId.get(1)?.result === 'string' ? byId.get(1).result : '0x';
+  const isSmartContract = codeHex !== '0x' && codeHex.length > 2;
+  if (!isSmartContract) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: `Address ${contractAddress} on ${rpcInfo.name} is an externally-owned account (EOA), not a deployed smart contract (0 bytecode).`,
+    };
+  }
+
+  // 2. Decode detected contract ownership address via provider getters
+  const ownershipProbes = OWNER_GETTER_PROBES.map((probe, idx) => {
+    const raw = byId.get(10 + idx);
+    const decoded = decodeAddressReturn(raw?.result);
+    return {
+      getter: probe.signature,
+      selector: probe.selector,
+      ownerAddress: decoded,
+    };
+  });
+
+  const primaryOwnerProbe = ownershipProbes.find((p) => Boolean(p.ownerAddress)) || null;
+  const contractOwner = primaryOwnerProbe?.ownerAddress || null;
+  const ownerSource = primaryOwnerProbe?.getter || null;
+
+  // 3. Query owner gas balance + optimal EIP-1559 fees
+  const rawGasPriceHex = byId.get(2)?.result;
+  const rpcGasPriceWei =
+    typeof rawGasPriceHex === 'string' && rawGasPriceHex.startsWith('0x') ? BigInt(rawGasPriceHex) : 1_000_000_000n;
+  const latestBlock = byId.get(3)?.result;
+  const baseFeePerGasWei =
+    typeof latestBlock?.baseFeePerGas === 'string' && latestBlock.baseFeePerGas.startsWith('0x')
+      ? BigInt(latestBlock.baseFeePerGas)
+      : null;
+  const rawPrioHex = byId.get(4)?.result;
+  const rpcMaxPriorityFeePerGasWei =
+    typeof rawPrioHex === 'string' && rawPrioHex.startsWith('0x') ? BigInt(rawPrioHex) : null;
+
+  let ownerGasBalanceWei = 0n;
+  if (contractOwner) {
+    try {
+      const ownerBalResp = await fetchRpcSingleWithFailover(chain, 'eth_getBalance', [contractOwner, 'latest'], true);
+      if (typeof ownerBalResp?.result === 'string' && ownerBalResp.result.startsWith('0x')) {
+        ownerGasBalanceWei = BigInt(ownerBalResp.result);
+      }
+    } catch {
+      ownerGasBalanceWei = 0n;
+    }
+  }
+
+  const optimalFees = computeOptimalFeeParams({
+    chain,
+    baseFeePerGasWei,
+    rpcMaxPriorityFeePerGasWei,
+    rpcGasPriceWei,
+    balanceWei: ownerGasBalanceWei > 0n ? ownerGasBalanceWei : undefined,
+    gasLimit: 85_000n,
+  });
+
+  // 4. Inspect ABI (user-supplied or verified Etherscan ABI) + bytecode for rescue/sweep functions
+  let abiSource: 'USER_PROVIDED' | 'ETHERSCAN_VERIFIED' | 'BYTECODE_ONLY' = 'BYTECODE_ONLY';
+  let abiFunctions: RescueSweepFunctionSpec[] = [];
+  let abiFetchNote: string | null = null;
+
+  if (params.rawAbi !== undefined && params.rawAbi !== null && String(params.rawAbi).trim() !== '') {
+    abiFunctions = inspectAbiForRescueSweep(params.rawAbi);
+    abiSource = 'USER_PROVIDED';
+  } else if (isEtherscanKeyConfigured()) {
+    try {
+      const abiRaw = await etherscanApi(
+        { module: 'contract', action: 'getabi', address: contractAddress },
+        rpcInfo.chainId,
+        { timeoutMs: 7000, retryDelaysMs: [] }
+      );
+      if (typeof abiRaw === 'string' && abiRaw.trim().startsWith('[')) {
+        abiFunctions = inspectAbiForRescueSweep(abiRaw);
+        abiSource = 'ETHERSCAN_VERIFIED';
+      }
+    } catch (abiErr: any) {
+      abiFetchNote = abiErr?.message || 'Etherscan ABI unavailable; used bytecode selector inspection.';
+    }
+  }
+
+  const bytecodeFunctions = detectBytecodeRescueSweepFunctions(codeHex);
+  const detectedFunctions =
+    abiSource === 'BYTECODE_ONLY'
+      ? bytecodeFunctions
+      : mergeDetectedRescueSweepFunctions(abiFunctions, []);
+
+  // 5. Gather all trapped native & ERC-20 token balances in the contract
+  const ethPriceUsd =
+    getLiveTokenUsdPrice(chainMeta.wrappedNativeSymbol, chain) ||
+    getLiveTokenUsdPrice(chainMeta.nativeSymbol, chain) ||
+    (balInfo.ethUsd && Number(balInfo.ethFormatted) > 0 ? balInfo.ethUsd / Number(balInfo.ethFormatted) : null);
+
+  const trappedAssets: TrappedAssetCandidate[] = [];
+  if (balInfo.ethWei > 0n) {
+    trappedAssets.push({
+      symbol: chainMeta.nativeSymbol,
+      address: null,
+      decimals: 18,
+      rawBalance: balInfo.ethWei,
+      formattedBalance: balInfo.ethFormatted,
+      usdValue: balInfo.ethUsd,
+      isNative: true,
+    });
+  }
+  for (const tok of balInfo.tokens) {
+    if (tok.rawBalance > 0n && tok.ercStandard === 'ERC-20') {
+      trappedAssets.push({
+        symbol: tok.symbol,
+        address: tok.address,
+        decimals: tok.decimals,
+        rawBalance: tok.rawBalance,
+        formattedBalance: tok.formatted,
+        usdValue: tok.usdValue,
+        isNative: false,
+      });
+    }
+  }
+
+  // 6. Plan gas-optimized recovery to FLASH_ARB_PROFIT_WALLET
+  const rawPlan = planGasOptimizedRecovery({
+    contractAddress,
+    contractOwner,
+    profitWallet: destinationWallet,
+    detectedFunctions,
+    trappedAssets,
+    effectiveGasPriceWei: optimalFees.maxFeePerGas,
+    ethPriceUsd,
+    skipGasNegativeDust: params.skipGasNegativeDust,
+  });
+
+  // 7. Live pre-flight simulation (eth_call + eth_estimateGas) for each planned contract rescue call
+  const simulatedExecutable: typeof rawPlan.executableSteps = [];
+  const simulatedSkipped: typeof rawPlan.skippedSteps = [...rawPlan.skippedSteps];
+
+  for (const step of rawPlan.executableSteps) {
+    if (step.actionType === 'OWNER_FORWARD_TRANSFER') {
+      // Forward transfer only executes after step 1 delivers balance to owner; keep estimated gas
+      simulatedExecutable.push(step);
+      continue;
+    }
+
+    if (!contractOwner) {
+      simulatedSkipped.push({
+        ...step,
+        status: 'SIMULATION_FAILED',
+        reason: 'No contract ownership address (owner()/admin()/governance()) detected via provider; cannot pre-flight simulate owner-gated call.',
+      });
+      continue;
+    }
+
+    try {
+      const [, estHex] = await Promise.all([
+        fetchRpcSingleWithFailover(
+          chain,
+          'eth_call',
+          [{ from: contractOwner, to: step.to, data: step.calldata }, 'latest'],
+          true
+        ),
+        fetchRpcSingleWithFailover(
+          chain,
+          'eth_estimateGas',
+          [{ from: contractOwner, to: step.to, data: step.calldata }, 'latest'],
+          true
+        ),
+      ]);
+
+      let gasUnits = BigInt(step.estimatedGasUnits);
+      if (typeof estHex?.result === 'string' && estHex.result.startsWith('0x')) {
+        const parsedEst = BigInt(estHex.result);
+        if (parsedEst > 0n) {
+          // 20% headroom above measured eth_estimateGas avoids paying excessive gas caps
+          gasUnits = (parsedEst * 120n) / 100n;
+        }
+      }
+
+      const costWei = gasUnits * optimalFees.maxFeePerGas;
+      const costUsd =
+        ethPriceUsd && ethPriceUsd > 0 ? Number((Number(ethers.formatEther(costWei)) * ethPriceUsd).toFixed(4)) : null;
+
+      if (
+        params.skipGasNegativeDust !== false &&
+        step.usdValue !== null &&
+        costUsd !== null &&
+        costUsd > step.usdValue
+      ) {
+        simulatedSkipped.push({
+          ...step,
+          estimatedGasUnits: gasUnits.toString(),
+          estimatedGasCostWei: costWei.toString(),
+          estimatedGasCostEth: ethers.formatEther(costWei),
+          estimatedGasCostUsd: costUsd,
+          status: 'SKIPPED_DUST',
+          reason: `Measured simulation gas ($${costUsd.toFixed(4)}) exceeds trapped ${step.tokenSymbol} value ($${step.usdValue.toFixed(4)}).`,
+        });
+        continue;
+      }
+
+      simulatedExecutable.push({
+        ...step,
+        estimatedGasUnits: gasUnits.toString(),
+        estimatedGasCostWei: costWei.toString(),
+        estimatedGasCostEth: ethers.formatEther(costWei),
+        estimatedGasCostUsd: costUsd,
+      });
+    } catch (simErr: any) {
+      simulatedSkipped.push({
+        ...step,
+        status: 'SIMULATION_FAILED',
+        reason: `Pre-flight simulation reverted (0 gas spent): ${decodeFlashArbRevertError(simErr)}`,
+      });
+    }
+  }
+
+  // Re-filter orphan step-2 forwards if step-1 failed simulation
+  const succeededStep1Keys = new Set(
+    simulatedExecutable
+      .filter((s) => s.actionType !== 'OWNER_FORWARD_TRANSFER')
+      .map((s) => s.tokenAddress || s.tokenSymbol)
+  );
+  const finalExecutable = simulatedExecutable
+    .filter(
+      (s) =>
+        s.actionType !== 'OWNER_FORWARD_TRANSFER' ||
+        succeededStep1Keys.has(s.tokenAddress || s.tokenSymbol)
+    )
+    .map((s, idx) => ({ ...s, stepIndex: idx + 1 }));
+
+  const totalEstGas = finalExecutable.reduce((acc, s) => acc + BigInt(s.estimatedGasUnits), 0n);
+  const totalEstCostWei = finalExecutable.reduce((acc, s) => acc + BigInt(s.estimatedGasCostWei), 0n);
+  const totalEstCostUsd =
+    ethPriceUsd && ethPriceUsd > 0 ? Number((Number(ethers.formatEther(totalEstCostWei)) * ethPriceUsd).toFixed(4)) : null;
+
+  const resolvedServer = resolveServerSigner();
+  const hasMatchingServerSigner = Boolean(
+    resolvedServer.ok &&
+      contractOwner &&
+      resolvedServer.address.toLowerCase() === contractOwner.toLowerCase()
+  );
+
+  return {
+    ok: true as const,
+    chain,
+    chainName: rpcInfo.name,
+    chainId: rpcInfo.chainId,
+    chainIdHex: CHAIN_ID_HEX_MAP[chain],
+    explorer: rpcInfo.explorer,
+    rpcUsed: batchResp.rpcUrl,
+    nativeSymbol: chainMeta.nativeSymbol,
+    contractAddress,
+    destinationWallet,
+    isProfitVaultDefault: destinationWallet.toLowerCase() === profitWalletEnv().toLowerCase(),
+    contractOwner,
+    ownerSource,
+    ownershipProbes,
+    ownerGasBalanceWei: ownerGasBalanceWei.toString(),
+    ownerGasBalanceFormatted: ethers.formatEther(ownerGasBalanceWei),
+    hasSufficientOwnerGas: finalExecutable.length === 0 ? true : ownerGasBalanceWei >= totalEstCostWei,
+    hasMatchingServerSigner,
+    serverSignerAddress: resolvedServer.ok ? resolvedServer.address : null,
+    abiSource,
+    abiFetchNote,
+    detectedFunctions,
+    trappedAssets: trappedAssets.map((a) => ({
+      symbol: a.symbol,
+      address: a.address,
+      decimals: a.decimals,
+      rawBalance: a.rawBalance.toString(),
+      formattedBalance: a.formattedBalance,
+      usdValue: a.usdValue,
+      isNative: a.isNative,
+    })),
+    optimalGas: {
+      baseFeeGwei: baseFeePerGasWei ? Number(ethers.formatUnits(baseFeePerGasWei, 'gwei')).toFixed(4) : null,
+      maxFeePerGasWei: optimalFees.maxFeePerGas.toString(),
+      maxFeePerGasGwei: Number(ethers.formatUnits(optimalFees.maxFeePerGas, 'gwei')).toFixed(4),
+      maxPriorityFeePerGasWei: optimalFees.maxPriorityFeePerGas.toString(),
+      maxPriorityFeePerGasGwei: Number(ethers.formatUnits(optimalFees.maxPriorityFeePerGas, 'gwei')).toFixed(4),
+    },
+    plan: {
+      ...rawPlan,
+      executableSteps: finalExecutable,
+      skippedSteps: simulatedSkipped,
+      totalEstimatedGasUnits: totalEstGas.toString(),
+      totalEstimatedGasCostWei: totalEstCostWei.toString(),
+      totalEstimatedGasCostEth: ethers.formatEther(totalEstCostWei),
+      totalEstimatedGasCostUsd: totalEstCostUsd,
+    },
+    timestamp: Date.now(),
+  };
+}
+
+/**
+ * POST /api/flash-arb/contract-rescue-agent/scan
+ * Detects deployed contract ownership via provider, inspects ABI & bytecode for rescue/sweep functions,
+ * scans trapped native/ERC-20 tokens, and builds a gas-optimized recovery plan to FLASH_ARB_PROFIT_WALLET.
+ */
+flashArbRouter.post('/contract-rescue-agent/scan', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || 'ethereum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${req.body?.chain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const contractAddress = normalizeValidContractAddress(
+      req.body?.contractAddress || DEPLOYED_CONTRACTS[chain] || (KNOWN_FLASH_ARB_CONTRACTS[chain] || [])[0] || ''
+    );
+    if (!contractAddress) {
+      return res.status(400).json({
+        success: false,
+        error: `Provide a valid deployed EVM contractAddress (0x...) on ${chain}.`,
+      });
+    }
+
+    const destinationWallet = normalizeValidContractAddress(req.body?.destinationWallet || profitWalletEnv());
+    if (!destinationWallet) {
+      return res.status(400).json({
+        success: false,
+        error: 'FLASH_ARB_PROFIT_WALLET is not configured or destinationWallet is invalid.',
+      });
+    }
+
+    const extraTokens = normalizeExtraTokenSpecs(
+      Array.isArray(req.body?.extraTokens)
+        ? req.body.extraTokens
+        : typeof req.body?.extraTokens === 'string'
+        ? req.body.extraTokens.split(',')
+        : []
+    );
+
+    const result = await runContractRescueAgentScan({
+      chain,
+      contractAddress,
+      destinationWallet,
+      rawAbi: req.body?.abi,
+      extraTokens,
+      skipGasNegativeDust: req.body?.skipGasNegativeDust !== false,
+    });
+
+    if (!result.ok) {
+      return res.status(result.statusCode).json({ success: false, error: result.error });
+    }
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Contract rescue scan failed.',
+    });
+  }
+});
+
+/**
+ * POST /api/flash-arb/contract-rescue-agent/execute
+ * Executes the gas-optimized contract rescue/sweep plan directly to FLASH_ARB_PROFIT_WALLET.
+ * Broadcasts autonomously when an owner private key is active on the server; otherwise returns verified unsigned EIP-1559 txs for MetaMask/Web3 signing.
+ */
+flashArbRouter.post('/contract-rescue-agent/execute', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || 'ethereum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${req.body?.chain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const contractAddress = normalizeValidContractAddress(
+      req.body?.contractAddress || DEPLOYED_CONTRACTS[chain] || (KNOWN_FLASH_ARB_CONTRACTS[chain] || [])[0] || ''
+    );
+    if (!contractAddress) {
+      return res.status(400).json({
+        success: false,
+        error: `Provide a valid deployed EVM contractAddress (0x...) on ${chain}.`,
+      });
+    }
+
+    const destinationWallet = normalizeValidContractAddress(req.body?.destinationWallet || profitWalletEnv());
+    if (!destinationWallet) {
+      return res.status(400).json({
+        success: false,
+        error: 'FLASH_ARB_PROFIT_WALLET is not configured or destinationWallet is invalid.',
+      });
+    }
+
+    // Optional explicit owner signer key/mnemonic passed only for broadcast
+    let explicitSigner: { address: string; privateKey: string } | null = null;
+    const rawKey = typeof req.body?.privateKey === 'string' ? req.body.privateKey.trim() : '';
+    const rawPass = typeof req.body?.passphrase === 'string' ? req.body.passphrase : '';
+    if (rawKey) {
+      const parsed = parseEvmPrivateKey(rawKey, { passphrase: rawPass || undefined });
+      if (!parsed.ok) {
+        return res.status(400).json({ success: false, error: `Invalid owner signer key: ${parsed.error}` });
+      }
+      explicitSigner = { address: parsed.address, privateKey: parsed.privateKey };
+    } else {
+      const serverSigner = resolveServerSigner();
+      if (serverSigner.ok) {
+        explicitSigner = { address: serverSigner.address, privateKey: serverSigner.privateKey };
+      }
+    }
+
+    const extraTokens = normalizeExtraTokenSpecs(
+      Array.isArray(req.body?.extraTokens)
+        ? req.body.extraTokens
+        : typeof req.body?.extraTokens === 'string'
+        ? req.body.extraTokens.split(',')
+        : []
+    );
+
+    const scan = await runContractRescueAgentScan({
+      chain,
+      contractAddress,
+      destinationWallet,
+      rawAbi: req.body?.abi,
+      extraTokens,
+      skipGasNegativeDust: req.body?.skipGasNegativeDust !== false,
+    });
+
+    if (!scan.ok) {
+      return res.status(scan.statusCode).json({ success: false, error: scan.error });
+    }
+
+    if (!scan.contractOwner) {
+      return res.status(400).json({
+        success: false,
+        error: `No contract owner/admin getter responded on ${contractAddress} (${scan.chainName}), so automated owner-authorized recovery cannot execute.`,
+        scan,
+      });
+    }
+
+    if (scan.detectedFunctions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Contract ${contractAddress} on ${scan.chainName} has no rescue/sweep function in its ABI or bytecode.`,
+        scan,
+      });
+    }
+
+    if (scan.plan.executableSteps.length === 0) {
+      const skipReason = scan.plan.skippedSteps[0]?.reason;
+      return res.status(400).json({
+        success: false,
+        error:
+          scan.trappedAssets.length === 0
+            ? `Contract ${contractAddress} holds 0 trapped ${scan.nativeSymbol} or ERC-20 tokens on ${scan.chainName}.`
+            : skipReason || `No executable rescue/sweep steps passed pre-flight simulation on ${scan.chainName}.`,
+        scan,
+      });
+    }
+
+    if (!scan.hasSufficientOwnerGas) {
+      return res.status(400).json({
+        success: false,
+        error: `Contract owner ${scan.contractOwner} needs ~${Number(scan.plan.totalEstimatedGasCostEth).toFixed(6)} ${scan.nativeSymbol} on ${scan.chainName} for gas (current balance: ${Number(scan.ownerGasBalanceFormatted).toFixed(6)} ${scan.nativeSymbol}).`,
+        signerAddress: scan.contractOwner,
+        scan,
+      });
+    }
+
+    const ownerMatchesSigner =
+      explicitSigner && explicitSigner.address.toLowerCase() === scan.contractOwner.toLowerCase();
+
+    if (ownerMatchesSigner && explicitSigner) {
+      const executedTxs: Array<{
+        stepIndex: number;
+        actionType: string;
+        functionSignature: string;
+        tokenSymbol: string;
+        amountFormatted: string;
+        txHash: string;
+        blockNumber: number;
+        gasUsed: string;
+        explorerUrl: string;
+      }> = [];
+
+      for (const step of scan.plan.executableSteps) {
+        const valueWei =
+          step.actionType === 'OWNER_FORWARD_TRANSFER' && !step.tokenAddress ? BigInt(step.amountWei) : 0n;
+        const sent = await broadcastSignedTxAndWait({
+          chain,
+          cleanKey: explicitSigner.privateKey,
+          to: step.to,
+          valueWei,
+          ...(step.calldata !== '0x' ? { data: step.calldata } : {}),
+          gasLimit: BigInt(step.estimatedGasUnits),
+          allowAutoSpeedUp: true,
+          urgencyMultiplierPct: chain === 'ethereum' ? 120 : 105,
+          minBalanceWei: 0n,
+        });
+        if (sent.receipt.status !== 1) {
+          return res.status(400).json({
+            success: false,
+            error: `Rescue step #${step.stepIndex} (${step.functionSignature} for ${step.tokenSymbol}) reverted on ${scan.chainName} (${sent.txHash}).`,
+            executedTxs,
+            txHash: sent.txHash,
+            explorerUrl: `${scan.explorer}/tx/${sent.txHash}`,
+            scan,
+          });
+        }
+        executedTxs.push({
+          stepIndex: step.stepIndex,
+          actionType: step.actionType,
+          functionSignature: step.functionSignature,
+          tokenSymbol: step.tokenSymbol,
+          amountFormatted: step.amountFormatted,
+          txHash: sent.txHash,
+          blockNumber: sent.receipt.blockNumber,
+          gasUsed: sent.receipt.gasUsed.toString(),
+          explorerUrl: `${scan.explorer}/tx/${sent.txHash}`,
+        });
+      }
+
+      invalidateBalanceResponseCaches(chain);
+      return res.json({
+        success: true,
+        mode: 'BROADCASTED',
+        chain,
+        chainName: scan.chainName,
+        contractAddress,
+        contractOwner: scan.contractOwner,
+        destinationWallet,
+        executedTxs,
+        scan,
+        message: `Recovered ${executedTxs.length} step(s) from ${contractAddress} to ${destinationWallet} on ${scan.chainName}.`,
+      });
+    }
+
+    // Prepare gas-optimized unsigned EIP-1559 transactions for owner Web3 wallet signature
+    const maxFeeHex = `0x${BigInt(scan.optimalGas.maxFeePerGasWei).toString(16)}`;
+    const maxPrioHex = `0x${BigInt(scan.optimalGas.maxPriorityFeePerGasWei).toString(16)}`;
+    const unsignedTxs = scan.plan.executableSteps.map((step) => {
+      const valueWei =
+        step.actionType === 'OWNER_FORWARD_TRANSFER' && !step.tokenAddress ? BigInt(step.amountWei) : 0n;
+      return {
+        stepIndex: step.stepIndex,
+        actionType: step.actionType,
+        functionSignature: step.functionSignature,
+        tokenSymbol: step.tokenSymbol,
+        amountFormatted: step.amountFormatted,
+        from: scan.contractOwner!,
+        to: step.to,
+        value: `0x${valueWei.toString(16)}`,
+        data: step.calldata,
+        gas: `0x${BigInt(step.estimatedGasUnits).toString(16)}`,
+        maxFeePerGas: maxFeeHex,
+        maxPriorityFeePerGas: maxPrioHex,
+        chainId: scan.chainId,
+        chainIdHex: scan.chainIdHex,
+      };
+    });
+
+    return res.json({
+      success: true,
+      mode: 'UNSIGNED_TX',
+      requiresWalletSigning: true,
+      signerRequired: scan.contractOwner,
+      chain,
+      chainName: scan.chainName,
+      contractAddress,
+      contractOwner: scan.contractOwner,
+      destinationWallet,
+      unsignedTxs,
+      scan,
+      message: `Prepared ${unsignedTxs.length} gas-optimized recovery transaction(s) to sweep trapped assets to ${destinationWallet}. Sign with owner ${scan.contractOwner}.`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Contract rescue execution failed.',
+    });
+  }
+});
+
+/**
+ * POST /api/flash-arb/contract-rescue-agent/confirm
+ * Verifies a browser-signed rescue transaction receipt on-chain and refreshes balance caches.
+ */
+flashArbRouter.post('/contract-rescue-agent/confirm', async (req: Request, res: Response) => {
+  try {
+    const rawChain = String(req.body?.chain || 'ethereum').toLowerCase();
+    if (!isSupportedArbChain(rawChain)) {
+      return res.status(400).json({ success: false, error: `Unsupported chain '${req.body?.chain}'.` });
+    }
+    const chain: SupportedArbChain = rawChain;
+    const rpcInfo = RPC_ENDPOINTS[chain] || RPC_ENDPOINTS.ethereum;
+    const txHash = String(req.body?.txHash || '').trim();
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+      return res.status(400).json({ success: false, error: 'Valid transaction hash (0x + 64 hex chars) is required.' });
+    }
+
+    const receipt = await waitForReceiptWithFailover(chain, txHash, 60_000);
+    if (receipt.status !== 1) {
+      return res.status(400).json({
+        success: false,
+        error: `Recovery transaction ${txHash} reverted on ${rpcInfo.name}.`,
+        txHash,
+        explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      });
+    }
+
+    invalidateBalanceResponseCaches(chain);
+    return res.json({
+      success: true,
+      txHash,
+      blockNumber: receipt.blockNumber,
+      gasUsed: receipt.gasUsed.toString(),
+      explorerUrl: `${rpcInfo.explorer}/tx/${txHash}`,
+      message: `Confirmed recovery transaction ${txHash.slice(0, 10)}... in block #${receipt.blockNumber}.`,
+    });
+  } catch (err: any) {
+    return res.status(err?.timedOut ? 504 : 500).json({
+      success: false,
+      error: err?.message || 'Could not confirm recovery transaction.',
     });
   }
 });

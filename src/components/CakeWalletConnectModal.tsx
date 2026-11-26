@@ -243,6 +243,20 @@ export const CakeWalletConnectModal: React.FC<CakeWalletConnectModalProps> = ({
                     </p>
                   </div>
 
+                  {/* QR Code Header & Refresh */}
+                  <div className="flex items-center justify-between px-2">
+                    <span className="text-[10px] text-slate-400 font-mono">Secure WalletConnect v2 Session</span>
+                    <button
+                      type="button"
+                      onClick={generateWcUri}
+                      className="text-[10px] text-orange-400 hover:text-orange-300 flex items-center gap-1 font-mono cursor-pointer transition-colors"
+                      title="Generate fresh WalletConnect pairing URI"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Regenerate QR</span>
+                    </button>
+                  </div>
+
                   {/* QR Code */}
                   <div className="py-2">
                     {generateQrSvg(wcUri || 'wc:cake-wallet-pairing')}

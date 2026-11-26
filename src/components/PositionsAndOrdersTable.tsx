@@ -1,14 +1,14 @@
 import React, { useState } from 'react';
-import { Position, Order } from '../types';
+import { Candle, Position, Order } from '../types';
 import { formatCurrency, formatPercent } from '../utils/cryptoMath';
+import { SymbolPnlChart } from './SymbolPnlChart';
 import {
   ArrowDownRight,
   ArrowUpRight,
-  Clock,
   History,
   Layers,
+  LineChart,
   Radio,
-  XCircle,
 } from 'lucide-react';
 
 interface PositionsAndOrdersTableProps {
@@ -16,6 +16,8 @@ interface PositionsAndOrdersTableProps {
   orders: Order[];
   onClosePosition: (positionId: string) => void;
   botLogs: string[];
+  selectedSymbol?: string;
+  candles?: Candle[];
 }
 
 export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = ({
@@ -23,14 +25,18 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
   orders,
   onClosePosition,
   botLogs,
+  selectedSymbol,
+  candles,
 }) => {
   const [activeTab, setActiveTab] = useState<'POSITIONS' | 'ORDERS' | 'LOGS'>('POSITIONS');
+  const [showPnlChart, setShowPnlChart] = useState<boolean>(true);
+  const activeSymbol = selectedSymbol || positions[0]?.symbol || orders[0]?.symbol || 'BTC/USDT';
 
   return (
     <div className="rounded-2xl bg-slate-900/70 border border-slate-800/80 shadow-xl backdrop-blur-sm overflow-hidden flex flex-col">
       {/* Tab Switcher Header */}
-      <div className="flex items-center justify-between border-b border-slate-800 bg-slate-950/40 px-4 py-2.5">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-slate-950/40 px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => setActiveTab('POSITIONS')}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
@@ -73,7 +79,31 @@ export const PositionsAndOrdersTable: React.FC<PositionsAndOrdersTableProps> = (
             <span>Agent Telemetry</span>
           </button>
         </div>
+
+        <button
+          type="button"
+          onClick={() => setShowPnlChart((prev) => !prev)}
+          aria-pressed={showPnlChart}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-colors ${
+            showPnlChart
+              ? 'bg-slate-800 text-emerald-300 border border-slate-700'
+              : 'text-slate-400 hover:text-slate-200 border border-transparent'
+          }`}
+        >
+          <LineChart className="h-3.5 w-3.5" />
+          <span>{activeSymbol} PnL Chart</span>
+        </button>
       </div>
+
+      {/* Realized vs. Unrealized PnL D3 Line Chart */}
+      {showPnlChart && (
+        <SymbolPnlChart
+          symbol={activeSymbol}
+          positions={positions}
+          orders={orders}
+          candles={candles}
+        />
+      )}
 
       {/* Content Area */}
       <div className="p-4 overflow-x-auto min-h-[220px] max-h-[360px] overflow-y-auto">

@@ -272,9 +272,17 @@ const EXTRA_CHAIN_TOKENS: Partial<Record<ChainKey, ArbTokenConfig[]>> = {
   base: [
     { symbol: 'WETH', name: 'Wrapped Ether', address: '0x4200000000000000000000000000000000000006', decimals: 18, category: 'Major', defaultLoan: 25, loanStep: 1, maxLoan: 500, typicalSpreadBps: 18 },
     { symbol: 'USDC', name: 'USD Coin', address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6, category: 'Stablecoin', defaultLoan: 25000, loanStep: 1000, maxLoan: 500000, typicalSpreadBps: 12 },
+    { symbol: 'USDbC', name: 'USD Base Coin', address: '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA', decimals: 6, category: 'Stablecoin', defaultLoan: 25000, loanStep: 1000, maxLoan: 500000, typicalSpreadBps: 14 },
+    { symbol: 'USDT', name: 'Tether USD', address: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2', decimals: 6, category: 'Stablecoin', defaultLoan: 25000, loanStep: 1000, maxLoan: 500000, typicalSpreadBps: 14 },
+    { symbol: 'cbETH', name: 'Coinbase Wrapped Staked ETH', address: '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22', decimals: 18, category: 'LST / LRT', defaultLoan: 10, loanStep: 1, maxLoan: 200, typicalSpreadBps: 20 },
+    { symbol: 'wstETH', name: 'Wrapped Lido Staked ETH', address: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452', decimals: 18, category: 'LST / LRT', defaultLoan: 10, loanStep: 1, maxLoan: 200, typicalSpreadBps: 20 },
+    { symbol: 'ezETH', name: 'Renzo Restaked ETH', address: '0x2416092f143378750bb29b79eD961ab195CcEea5', decimals: 18, category: 'LST / LRT', defaultLoan: 10, loanStep: 1, maxLoan: 200, typicalSpreadBps: 24 },
     { symbol: 'cbBTC', name: 'Coinbase Wrapped BTC', address: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', decimals: 8, category: 'Major', defaultLoan: 2, loanStep: 0.25, maxLoan: 40, typicalSpreadBps: 18 },
     { symbol: 'AERO', name: 'Aerodrome', address: '0x940181a94A35A4569E4529A3CDfB74e38FD98631', decimals: 18, category: 'Ecosystem', defaultLoan: 10000, loanStep: 500, maxLoan: 200000, typicalSpreadBps: 26 },
+    { symbol: 'DAI', name: 'Dai Stablecoin', address: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', decimals: 18, category: 'Stablecoin', defaultLoan: 25000, loanStep: 1000, maxLoan: 500000, typicalSpreadBps: 14 },
     { symbol: 'DEGEN', name: 'Degen', address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed', decimals: 18, category: 'Meme', defaultLoan: 250000, loanStep: 10000, maxLoan: 5000000, typicalSpreadBps: 35 },
+    { symbol: 'VIRTUAL', name: 'Virtuals Protocol', address: '0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b', decimals: 18, category: 'DeFi', defaultLoan: 10000, loanStep: 500, maxLoan: 200000, typicalSpreadBps: 30 },
+    { symbol: 'MORPHO', name: 'Morpho Token', address: '0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842', decimals: 18, category: 'DeFi', defaultLoan: 10000, loanStep: 500, maxLoan: 200000, typicalSpreadBps: 25 },
   ],
   ethereum: [
     { symbol: 'WETH', name: 'Wrapped Ether', address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18, category: 'Major', defaultLoan: 50, loanStep: 1, maxLoan: 1000, typicalSpreadBps: 14 },

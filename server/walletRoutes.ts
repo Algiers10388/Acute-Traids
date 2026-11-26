@@ -6,6 +6,7 @@ import {
   isQuotaOrRateLimitHttpStatus,
   isRpcQuotaOrRateLimitError,
 } from './rpcSourceRegistry.ts';
+import { etherscanApi, isEtherscanKeyConfigured } from './etherscanService.ts';
 
 export const walletRouter = express.Router();
 
@@ -234,6 +235,16 @@ const BLOCKSCOUT_APIS: Record<string, string> = {
   polygon: 'https://polygon.blockscout.com/api',
 };
 
+const EVM_NETWORK_CHAIN_IDS: Record<string, number> = {
+  ethereum: 1,
+  arbitrum: 42161,
+  base: 8453,
+  optimism: 10,
+  polygon: 137,
+};
+
+const explorerCooldowns = new Map<string, number>();
+
 async function queryErc20Balance(network: string, tokenAddress: string, walletAddress: string, decimals: number): Promise<number> {
   try {
     const cleanWallet = walletAddress.toLowerCase().replace('0x', '').padStart(64, '0');
@@ -249,49 +260,113 @@ async function queryErc20Balance(network: string, tokenAddress: string, walletAd
   return 0;
 }
 
-async function fetchRealEvmTransactions(network: string, address: string, spotPrices: Record<string, number>): Promise<any[]> {
-  const apiUrl = BLOCKSCOUT_APIS[network];
-  if (!apiUrl) return [];
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
-    const res = await fetch(`${apiUrl}?module=account&action=txlist&address=${address}&page=1&offset=15&sort=desc`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!res.ok) return [];
-    const data = await res.json();
-    if (data.status === '1' && Array.isArray(data.result)) {
-      const nativePrice = network === 'okx_xlayer' ? spotPrices.OKB : network === 'polygon' ? spotPrices.POL : spotPrices.ETH;
-      return data.result.map((tx: any) => {
-        const valWei = BigInt(tx.value || '0');
-        const valNative = Number(valWei) / 1e18;
-        const gasUsed = Number(tx.gasUsed || tx.gas || '21000');
-        const gasPriceWei = BigInt(tx.gasPrice || '1000000000');
-        const feeNative = Number(gasPriceWei * BigInt(gasUsed)) / 1e18;
-        const isFrom = tx.from?.toLowerCase() === address.toLowerCase();
+function mapExplorerTxRows(rows: any[], network: string, address: string, spotPrices: Record<string, number>): any[] {
+  const nativePrice = network === 'okx_xlayer' ? spotPrices.OKB : network === 'polygon' ? spotPrices.POL : spotPrices.ETH;
+  return rows.map((tx: any) => {
+    const valWei = BigInt(tx.value || '0');
+    const valNative = Number(valWei) / 1e18;
+    const gasUsed = Number(tx.gasUsed || tx.gas || '21000');
+    const gasPriceWei = BigInt(tx.gasPrice || '1000000000');
+    const feeNative = Number(gasPriceWei * BigInt(gasUsed)) / 1e18;
+    const isFrom = tx.from?.toLowerCase() === address.toLowerCase();
 
-        return {
-          hash: tx.hash,
-          blockNumber: parseInt(tx.blockNumber, 10) || 0,
-          timestamp: (parseInt(tx.timeStamp, 10) || Math.floor(Date.now() / 1000)) * 1000,
-          from: tx.from,
-          to: tx.to || 'Contract Creation',
-          direction: isFrom ? 'OUT' : 'IN',
-          method: tx.functionName ? tx.functionName.split('(')[0] : (tx.input && tx.input !== '0x' ? 'Smart Contract Call' : 'Transfer'),
-          actionSummary: isFrom 
-            ? `Sent ${valNative.toFixed(4)} native coin to ${(tx.to || '').slice(0, 10)}...`
-            : `Received ${valNative.toFixed(4)} native coin from ${(tx.from || '').slice(0, 10)}...`,
-          valueNative: valNative,
-          valueUsd: valNative * nativePrice,
-          feeUsd: feeNative * nativePrice,
-          status: tx.isError === '0' ? 'SUCCESS' : 'FAILED',
-        };
-      });
+    return {
+      hash: tx.hash,
+      blockNumber: parseInt(tx.blockNumber, 10) || 0,
+      timestamp: (parseInt(tx.timeStamp, 10) || Math.floor(Date.now() / 1000)) * 1000,
+      from: tx.from,
+      to: tx.to || 'Contract Creation',
+      direction: isFrom ? 'OUT' : 'IN',
+      method: tx.functionName
+        ? tx.functionName.split('(')[0]
+        : tx.input && tx.input !== '0x'
+        ? 'Smart Contract Call'
+        : 'Transfer',
+      actionSummary: isFrom
+        ? `Sent ${valNative.toFixed(4)} native coin to ${(tx.to || '').slice(0, 10)}...`
+        : `Received ${valNative.toFixed(4)} native coin from ${(tx.from || '').slice(0, 10)}...`,
+      valueNative: valNative,
+      valueUsd: valNative * nativePrice,
+      feeUsd: feeNative * nativePrice,
+      status: tx.isError === '0' ? 'SUCCESS' : 'FAILED',
+    };
+  });
+}
+
+async function fetchExplorerJsonWithTimeout(url: string, timeoutMs = 8000): Promise<any | null> {
+  const cooledUntil = explorerCooldowns.get(url.split('?')[0]) || 0;
+  if (Date.now() < cooledUntil) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      if (res.status === 403 || res.status === 429 || res.status >= 500) {
+        explorerCooldowns.set(url.split('?')[0], Date.now() + 60_000);
+      }
+      return null;
     }
-  } catch (e) {
-    console.warn(`Blockscout transaction query warning for ${network}:`, e);
+    const rawText = await res.text();
+    const trimmed = rawText.trim();
+    if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
+      // Upstream returned HTML challenge or non-JSON body
+      explorerCooldowns.set(url.split('?')[0], Date.now() + 60_000);
+      return null;
+    }
+    return JSON.parse(trimmed);
+  } catch (err: any) {
+    // Cool down temporarily on timeout/abort or transient network failures without noisy AbortError logs
+    explorerCooldowns.set(url.split('?')[0], Date.now() + 60_000);
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+async function fetchRealEvmTransactions(network: string, address: string, spotPrices: Record<string, number>): Promise<any[]> {
+  const chainId = EVM_NETWORK_CHAIN_IDS[network];
+
+  // 1. Prefer authenticated Etherscan V2 multichain API if configured
+  if (chainId && isEtherscanKeyConfigured()) {
+    try {
+      const result = await etherscanApi(
+        { module: 'account', action: 'txlist', address, page: 1, offset: 15, sort: 'desc' },
+        chainId,
+        { timeoutMs: 7000, retryDelaysMs: [500] }
+      );
+      if (Array.isArray(result)) {
+        return mapExplorerTxRows(result, network, address, spotPrices);
+      }
+    } catch {
+      // Non-fatal; fall through to public explorer endpoints
+    }
+  }
+
+  // 2. Public explorer endpoints (Blockscout + Routescan where supported) with timeout/HTML protection
+  const candidateUrls: string[] = [];
+  if (network === 'ethereum') {
+    candidateUrls.push(
+      `https://api.routescan.io/v2/network/mainnet/evm/1/etherscan/api?module=account&action=txlist&address=${address}&page=1&offset=15&sort=desc`
+    );
+  }
+  const blockscoutUrl = BLOCKSCOUT_APIS[network];
+  if (blockscoutUrl) {
+    candidateUrls.push(
+      `${blockscoutUrl}?module=account&action=txlist&address=${address}&page=1&offset=15&sort=desc`
+    );
+  }
+
+  for (const url of candidateUrls) {
+    const data = await fetchExplorerJsonWithTimeout(url, 8000);
+    if (data?.status === '1' && Array.isArray(data.result)) {
+      return mapExplorerTxRows(data.result, network, address, spotPrices);
+    }
+  }
+
   return [];
 }
 

@@ -301,6 +301,7 @@ export const CHAIN_TOKENS: Record<SupportedArbChain, Record<string, ArbitrumToke
     LINK: { sym: 'LINK', addr: '0x514910771AF9Ca656af840dff83E8264EcF986CA', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
     UNI: { sym: 'UNI', addr: '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984', dec: 18, ercStandard: 'ERC-2612', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
     AAVE: { sym: 'AAVE', addr: '0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 · FlashArb & Sweep Compatible' },
+    APE: { sym: 'APE', addr: '0x4d22445b0d133b9225e2d86dc8841637c8d884fd', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ApeCoin (Ethereum L1) · FlashArb & Sweep Compatible' },
   },
   polygon: {
     WMATIC: { sym: 'WMATIC', addr: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', dec: 18, ercStandard: 'ERC-20', arbCompatible: true, sweepCompatible: true, walletSweepCompatible: true, compatibilityNote: 'ERC-20 (Wrapped POL) · FlashArb & Sweep Compatible' },
@@ -866,7 +867,9 @@ export const FLASH_ARB_OPTIMIZED_ABI = [
 
 export const ERC20_MIN_ABI = [
   'function balanceOf(address account) view returns (uint256)',
+  'function allowance(address owner, address spender) view returns (uint256)',
   'function transfer(address recipient, uint256 amount) returns (bool)',
+  'function transferFrom(address sender, address recipient, uint256 amount) returns (bool)',
   'event Transfer(address indexed from, address indexed to, uint256 value)',
 ];
 
@@ -1206,6 +1209,199 @@ export function encodeErc20Transfer(recipient: string, amount: bigint): string {
   return erc20Iface.encodeFunctionData('transfer', [recipient, amount]);
 }
 
+export function encodeErc20Allowance(owner: string, spender: string): string {
+  return erc20Iface.encodeFunctionData('allowance', [owner, spender]);
+}
+
+export function encodeErc20TransferFrom(sender: string, recipient: string, amount: bigint): string {
+  return erc20Iface.encodeFunctionData('transferFrom', [sender, recipient, amount]);
+}
+
+export interface VaultTransferExecutionPlanInput {
+  isNativeTransfer: boolean;
+  sourceVaultAddress: string;
+  depositAddress: string;
+  activeSignerAddress: string | null;
+  isSourceContract: boolean;
+  assetSymbol: string;
+  amountWei: bigint;
+  rawBalanceWei?: bigint;
+  formattedBalance?: string;
+  tokenAddress?: string | null;
+  allowanceWei?: bigint;
+  formattedAllowance?: string;
+  contractOwner?: string | null;
+  hasRescueTokensTo?: boolean;
+  hasDirectFlashArb?: boolean;
+}
+
+export type VaultTransferExecutionPlanResult =
+  | {
+      ok: true;
+      effectiveSender: string;
+      callTarget: string;
+      usesTransferFrom: boolean;
+      usesContractRescue: boolean;
+      methodLabel: string;
+      calldata: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      signerMismatch: boolean;
+    };
+
+/**
+ * Validates that the actual transaction sender (`activeSignerAddress` when broadcasting from
+ * a private key, or `contractOwner` / `sourceVaultAddress` for Web3 UNSIGNED_TX) is authorized
+ * to move assets from `sourceVaultAddress` BEFORE pre-flight simulation or on-chain broadcast.
+ * Supports:
+ * 1) Owned FlashArb / rescueable smart contracts (`rescueTokensTo` / `executeDirectFlashArb`)
+ * 2) Direct EOA transfers (`transfer` / native value send)
+ * 3) Approved `ERC20.transferFrom` delegates
+ */
+export function resolveVaultTransferExecutionPlan(
+  input: VaultTransferExecutionPlanInput
+): VaultTransferExecutionPlanResult {
+  const sourceLower = input.sourceVaultAddress.toLowerCase();
+  const signerLower = input.activeSignerAddress ? input.activeSignerAddress.toLowerCase() : null;
+  const ownerLower = input.contractOwner ? input.contractOwner.toLowerCase() : null;
+  const isDifferentSigner = Boolean(signerLower && signerLower !== sourceLower);
+
+  // Owned smart-contract rescue path (e.g. FlashArbOptimized vault contracts)
+  if (input.isSourceContract) {
+    if (!input.isNativeTransfer && input.hasRescueTokensTo && input.tokenAddress) {
+      const effectiveSender = input.activeSignerAddress || input.contractOwner || input.sourceVaultAddress;
+      if (!input.contractOwner) {
+        return {
+          ok: false,
+          signerMismatch: false,
+          error: `Contract ${input.sourceVaultAddress} did not expose a valid owner() address on-chain.`,
+        };
+      }
+      if (input.activeSignerAddress && ownerLower !== signerLower) {
+        return {
+          ok: false,
+          signerMismatch: true,
+          error: `Contract withdrawal blocked (0 gas spent): ${input.sourceVaultAddress} is owned by ${input.contractOwner}, which does not match signer ${input.activeSignerAddress}. Connect or enter the key for owner ${input.contractOwner}.`,
+        };
+      }
+      if (
+        input.rawBalanceWei !== undefined &&
+        input.rawBalanceWei > 0n &&
+        input.amountWei < input.rawBalanceWei
+      ) {
+        return {
+          ok: false,
+          signerMismatch: false,
+          error: `Contract ${input.sourceVaultAddress} withdraws full token balance via rescueTokensTo(). Click MAX (${input.formattedBalance ?? ethers.formatEther(input.rawBalanceWei)} ${input.assetSymbol}) to withdraw from this contract.`,
+        };
+      }
+      return {
+        ok: true,
+        effectiveSender,
+        callTarget: input.sourceVaultAddress,
+        usesTransferFrom: false,
+        usesContractRescue: true,
+        methodLabel: 'rescueTokensTo(token, recipient)',
+        calldata: encodeRescueTokensTo(input.tokenAddress, input.depositAddress),
+      };
+    }
+
+    if (input.isNativeTransfer && input.hasDirectFlashArb) {
+      const effectiveSender = input.activeSignerAddress || input.contractOwner || input.sourceVaultAddress;
+      if (!input.contractOwner) {
+        return {
+          ok: false,
+          signerMismatch: false,
+          error: `Contract ${input.sourceVaultAddress} did not expose a valid owner() address on-chain.`,
+        };
+      }
+      if (input.activeSignerAddress && ownerLower !== signerLower) {
+        return {
+          ok: false,
+          signerMismatch: true,
+          error: `Contract native sweep blocked (0 gas spent): ${input.sourceVaultAddress} is owned by ${input.contractOwner}, which does not match signer ${input.activeSignerAddress}. Connect or enter the key for owner ${input.contractOwner}.`,
+        };
+      }
+      return {
+        ok: true,
+        effectiveSender,
+        callTarget: input.sourceVaultAddress,
+        usesTransferFrom: false,
+        usesContractRescue: true,
+        methodLabel: 'executeDirectFlashArb(recipient)',
+        calldata: encodeExecuteDirectFlashArb(input.depositAddress),
+      };
+    }
+  }
+
+  if (input.isNativeTransfer) {
+    if (isDifferentSigner && input.activeSignerAddress) {
+      return {
+        ok: false,
+        signerMismatch: true,
+        error: input.isSourceContract
+          ? `Native transfer blocked (0 gas spent): Source ${input.sourceVaultAddress} is a smart contract without executeDirectFlashArb() owner sweep (public token contracts like WETH9 cannot be drained by external signers). Switch Source Wallet to a deployed FlashArb contract, your Connected Web3 Wallet, or ${input.activeSignerAddress}.`
+          : `Native transfer blocked (0 gas spent): Provided signer key resolves to ${input.activeSignerAddress}, which does not match source Vault ${input.sourceVaultAddress}. Enter the key for ${input.sourceVaultAddress} or switch Source Wallet to ${input.activeSignerAddress}.`,
+      };
+    }
+    if (input.isSourceContract && !input.activeSignerAddress) {
+      return {
+        ok: false,
+        signerMismatch: true,
+        error: `Native transfer blocked (0 gas spent): ${input.sourceVaultAddress} is a smart contract without an active owner rescue path. Connect the contract owner Web3 wallet or switch Source Wallet to an EOA / deployed FlashArb contract.`,
+      };
+    }
+    return {
+      ok: true,
+      effectiveSender: input.activeSignerAddress || input.sourceVaultAddress,
+      callTarget: input.depositAddress,
+      usesTransferFrom: false,
+      usesContractRescue: false,
+      methodLabel: 'nativeTransfer',
+      calldata: '0x',
+    };
+  }
+
+  // ERC-20 transfer path (direct signer or approved transferFrom delegate)
+  const tokenTarget = input.tokenAddress || input.sourceVaultAddress;
+  if (!isDifferentSigner && !input.isSourceContract) {
+    return {
+      ok: true,
+      effectiveSender: input.activeSignerAddress || input.sourceVaultAddress,
+      callTarget: tokenTarget,
+      usesTransferFrom: false,
+      usesContractRescue: false,
+      methodLabel: 'ERC20.transfer(recipient, amount)',
+      calldata: encodeErc20Transfer(input.depositAddress, input.amountWei),
+    };
+  }
+
+  const allowanceWei = input.allowanceWei ?? 0n;
+  if (allowanceWei >= input.amountWei && input.activeSignerAddress) {
+    return {
+      ok: true,
+      effectiveSender: input.activeSignerAddress,
+      callTarget: tokenTarget,
+      usesTransferFrom: true,
+      usesContractRescue: false,
+      methodLabel: 'ERC20.transferFrom(vault, recipient, amount)',
+      calldata: encodeErc20TransferFrom(input.sourceVaultAddress, input.depositAddress, input.amountWei),
+    };
+  }
+
+  const signerAddr = input.activeSignerAddress || input.sourceVaultAddress;
+  const availAllowance = input.formattedAllowance ?? allowanceWei.toString();
+  return {
+    ok: false,
+    signerMismatch: true,
+    error: input.isSourceContract
+      ? `ERC-20 transfer blocked (0 gas spent): ${input.sourceVaultAddress} is a smart contract without rescueTokensTo() ownership or ${input.assetSymbol} transferFrom allowance for ${signerAddr} (public contracts like WETH9 cannot authorize external signers). Switch Source Wallet to a deployed FlashArb contract, Connected Web3, or an EOA holding ${input.assetSymbol}.`
+      : `ERC-20 transfer blocked (0 gas spent): Signer ${signerAddr} does not match source Vault ${input.sourceVaultAddress} and only has ${availAllowance} ${input.assetSymbol} transferFrom allowance. Provide the key for ${input.sourceVaultAddress}, approve ${signerAddr}, or switch Source Wallet to ${signerAddr}.`,
+  };
+}
+
 export function decodeArbitrageSwapsExecutedLogs(
   logs: Array<{ address?: string; topics: string[]; data: string }>,
   contractAddress: string
@@ -1259,14 +1455,25 @@ export function parseInsufficientProfitError(errOrHex: any): { actual: bigint; r
   return null;
 }
 
+const COMMON_REVERT_IFACE = new ethers.Interface([
+  'error Panic(uint256 code)',
+  'error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed)',
+  'error ERC20InsufficientBalance(address sender, uint256 balance, uint256 needed)',
+  'error AllowanceExpired(uint256 deadline)',
+  'error InsufficientAllowance(uint256 amount)',
+]);
+
 export function decodeFlashArbRevertError(err: any): string {
-  const rawData =
+  const rawDataCandidate =
+    err?.data?.data ||
     err?.data ||
+    err?.error?.data?.data ||
     err?.error?.data ||
     err?.info?.error?.data ||
     null;
+  const rawData = typeof rawDataCandidate === 'string' ? rawDataCandidate.trim() : null;
 
-  if (typeof rawData === 'string' && rawData.startsWith('0x') && rawData.length >= 10) {
+  if (rawData && rawData.startsWith('0x') && rawData.length >= 10) {
     try {
       const parsed = flashArbIface.parseError(rawData);
       if (parsed) {
@@ -1279,18 +1486,46 @@ export function decodeFlashArbRevertError(err: any): string {
         return `${parsed.name}()`;
       }
     } catch {
-      // fallback to Error(string)
+      // fallback to standard Solidity/OZ error decoders
     }
 
-    if (rawData.startsWith('0x08c379a0') && rawData.length >= 138) {
+    if (rawData.toLowerCase().startsWith('0x08c379a0') && rawData.length >= 138) {
       try {
         const [reason] = ethers.AbiCoder.defaultAbiCoder().decode(['string'], `0x${rawData.slice(10)}`);
-        if (reason) return String(reason);
+        if (reason && String(reason).trim().length > 0) return String(reason);
+        return 'Execution reverted with empty Error() (insufficient token allowance/balance or invalid pool/fee tier)';
       } catch {}
     }
+
+    try {
+      const commonParsed = COMMON_REVERT_IFACE.parseError(rawData);
+      if (commonParsed) {
+        if (commonParsed.name === 'Panic') {
+          return `Panic(0x${BigInt(commonParsed.args.code).toString(16)})`;
+        }
+        if (commonParsed.name === 'ERC20InsufficientAllowance') {
+          return `ERC20InsufficientAllowance(spender=${commonParsed.args.spender}, allowance=${commonParsed.args.allowance.toString()}, needed=${commonParsed.args.needed.toString()})`;
+        }
+        if (commonParsed.name === 'ERC20InsufficientBalance') {
+          return `ERC20InsufficientBalance(sender=${commonParsed.args.sender}, balance=${commonParsed.args.balance.toString()}, needed=${commonParsed.args.needed.toString()})`;
+        }
+        return `${commonParsed.name}()`;
+      }
+    } catch {
+      // fallback to selector diagnostic
+    }
+
+    const msgCandidate = String(err?.shortMessage || err?.reason || err?.message || '').trim();
+    if (!msgCandidate || msgCandidate === 'Error()' || /^execution reverted$/i.test(msgCandidate)) {
+      return `Execution reverted with custom error selector ${rawData.slice(0, 10)}`;
+    }
+    return msgCandidate;
   }
 
-  const msg = String(err?.shortMessage || err?.reason || err?.message || 'Execution reverted');
+  const msg = String(err?.shortMessage || err?.reason || err?.message || 'Execution reverted').trim();
+  if (rawData === '0x' || msg === 'Error()' || /^execution reverted$/i.test(msg)) {
+    return 'Execution reverted with Error() (insufficient token allowance, WETH/ERC20 transferFrom failure, or missing pool liquidity at selected fee tier)';
+  }
   return msg;
 }
 

@@ -163,6 +163,26 @@ test('decodeFlashArbRevertError decodes custom InsufficientProfit & MinProfitReq
   );
   const minProfitData = iface.encodeErrorResult('MinProfitRequired', []);
   assert.equal(decodeFlashArbRevertError({ data: minProfitData }), 'MinProfitRequired()');
+
+  const ozAllowanceIface = new ethers.Interface([
+    'error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed)',
+  ]);
+  const allowErrData = ozAllowanceIface.encodeErrorResult('ERC20InsufficientAllowance', [
+    RECIPIENT,
+    0n,
+    1000n,
+  ]);
+  assert.match(
+    decodeFlashArbRevertError({ data: { data: allowErrData } }),
+    /ERC20InsufficientAllowance\(spender=.*, allowance=0, needed=1000\)/
+  );
+
+  assert.match(decodeFlashArbRevertError({ message: 'Error()' }), /Execution reverted with Error\(\)/);
+  assert.match(decodeFlashArbRevertError({ data: '0x' }), /Execution reverted with Error\(\)/);
+  assert.equal(
+    decodeFlashArbRevertError({ data: '0xdeadbeef00000001', message: 'Error()' }),
+    'Execution reverted with custom error selector 0xdeadbeef'
+  );
 });
 
 test('CHAIN_TOKENS & getChainTokens expose verified multi-chain tokens with compatibility flags', () => {

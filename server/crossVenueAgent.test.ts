@@ -488,3 +488,145 @@ test('executeDualVenueCorridorTrade rejects zero or invalid profitWallet before 
   assert.equal(calledTx, false);
   assert.match(badRes.error || '', /Profit Vault destination address is missing or invalid/i);
 });
+
+test('executeDualVenueCorridorTrade preflights unapproved UNIV2 via getAmountsOut (0xd06ca61f) before approving and executing', async () => {
+  const sentTxs: Array<{ chain: string; to: string; data: string }> = [];
+  const ethCallSelectors: string[] = [];
+  const corridor = makeEthCorridor({
+    id: 'l4-btc-avalanche-arbitrum',
+    asset: 'WBTC',
+    buyChain: 'avalanche',
+    buyChainName: 'Avalanche',
+    buyDex: 'Trader Joe V1',
+    buyPair: 'BTCb/WAVAX',
+    buyPool: '0x0000000000000000000000000000000000000002',
+    buyPriceUsd: 60000,
+    sellChain: 'arbitrum',
+    sellChainName: 'Arbitrum',
+    sellDex: 'Sushiswap V2',
+    sellPair: 'WBTC/USDC',
+    sellPool: '0x0000000000000000000000000000000000000003',
+    sellPriceUsd: 60600,
+    recommendedClipUsd: 1000,
+  });
+
+  const res = await executeDualVenueCorridorTrade(corridor, {
+    signerAddress: SIGNER_ADDR,
+    cleanKey: '0x' + '22'.repeat(32),
+    profitWallet: PROFIT_VAULT,
+    getRouterCaps: async () => undefined,
+    getTokenUsdPrice: (sym) => (sym === 'WAVAX' ? 25 : 60000),
+    getGasPriceGwei: () => 0.1,
+    rpcCall: async (chain, method, params) => {
+      if (method === 'eth_getBalance') return '0x0de0b6b3a7640000';
+      if (method === 'eth_gasPrice') return '0x5f5e100';
+      if (method === 'eth_call') {
+        const data = String(params[0]?.data || '');
+        ethCallSelectors.push(data.slice(0, 10));
+        if (data.startsWith('0x70a08231')) {
+          return chain === 'avalanche'
+            ? ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [ethers.parseEther('100')]) // 100 WAVAX ($2,500)
+            : ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [100_000_000n]); // 1.0 WBTC (8 dec)
+        }
+        if (data.startsWith('0xdd62ed3e')) {
+          // Zero allowance prior to execution
+          return ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [0n]);
+        }
+        if (data.startsWith('0x38ed1739')) {
+          throw new Error('execution reverted: TransferHelper: TRANSFER_FROM_FAILED');
+        }
+        if (data.startsWith('0xd06ca61f')) {
+          return chain === 'avalanche'
+            ? ethers.AbiCoder.defaultAbiCoder().encode(['uint256[]'], [[ethers.parseEther('40'), 1_666_666n]])
+            : ethers.AbiCoder.defaultAbiCoder().encode(['uint256[]'], [[1_666_666n, 1_025_000_000n]]);
+        }
+      }
+      return '0x';
+    },
+    sendSignedTxAndWait: async ({ chain, to, data }) => {
+      sentTxs.push({ chain, to, data });
+      return {
+        txHash: `0x${String(sentTxs.length).padStart(64, 'f')}`,
+        receipt: { status: 1, blockNumber: 400, gasUsed: 150000n, effectiveGasPrice: 100000000n },
+      };
+    },
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(ethCallSelectors.includes('0x38ed1739'), false); // never called transferFrom-dependent swapExactTokensForTokens during preflight
+  assert.equal(ethCallSelectors.filter((s) => s === '0xd06ca61f').length, 2); // used allowance-free getAmountsOut on both Buy & Sell
+  // Expect 5 txs: approve buy + approve sell (parallel), then buy swap + sell swap (parallel), then profit sweep
+  assert.equal(sentTxs.length, 5);
+  assert.ok(sentTxs[0].data.startsWith('0x095ea7b3'));
+  assert.ok(sentTxs[1].data.startsWith('0x095ea7b3'));
+  assert.ok(sentTxs[2].data.startsWith('0x38ed1739'));
+  assert.ok(sentTxs[3].data.startsWith('0x38ed1739'));
+  assert.ok(sentTxs[4].data.startsWith('0xa9059cbb'));
+  assert.equal(Number(res.trade?.realizedProfitAmount), 25);
+});
+
+test('executeDualVenueCorridorTrade uses QuoterV2 (0xc6a5026a) when router allowance is 0 and recovers feeUnits from pool/quoter', async () => {
+  const sentTxs: Array<{ chain: string; to: string; data: string }> = [];
+  const ethCallSelectors: string[] = [];
+  const corridor = makeEthCorridor({
+    buyFeePercent: 0.009, // non-standard fee percent that rounds to 90 without live pool/quoter probe
+    recommendedClipUsd: 25000,
+  });
+
+  const res = await executeDualVenueCorridorTrade(corridor, {
+    signerAddress: SIGNER_ADDR,
+    cleanKey: '0x' + '22'.repeat(32),
+    profitWallet: PROFIT_VAULT,
+    getRouterCaps: async () => undefined,
+    getTokenUsdPrice: () => 2500,
+    getGasPriceGwei: () => 0.1,
+    rpcCall: async (chain, method, params) => {
+      if (method === 'eth_getBalance') return '0x0de0b6b3a7640000';
+      if (method === 'eth_gasPrice') return '0x5f5e100';
+      if (method === 'eth_call') {
+        const data = String(params[0]?.data || '');
+        ethCallSelectors.push(data.slice(0, 10));
+        if (data.startsWith('0x70a08231')) {
+          return chain === 'arbitrum'
+            ? ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [50_000_000_000n])
+            : ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [ethers.parseEther('20')]);
+        }
+        if (data.startsWith('0xdd62ed3e')) {
+          // Unapproved router -> SwapRouter.exactInputSingle would revert with empty Error()
+          return ethers.AbiCoder.defaultAbiCoder().encode(['uint256'], [0n]);
+        }
+        if (data.startsWith('0xddca3f43')) {
+          // pool.fee() returns 500
+          return ethers.AbiCoder.defaultAbiCoder().encode(['uint24'], [500]);
+        }
+        if (data.startsWith('0x414bf389') || data.startsWith('0x04e45aaf')) {
+          throw new Error('Error()');
+        }
+        if (data.startsWith('0xc6a5026a')) {
+          // QuoterV2.quoteExactInputSingle returns (uint256 amountOut, uint160, uint32, uint256)
+          return ethers.AbiCoder.defaultAbiCoder().encode(
+            ['uint256', 'uint160', 'uint32', 'uint256'],
+            chain === 'arbitrum'
+              ? [ethers.parseEther('10.08'), 0n, 0, 100000n]
+              : [25_400_000_000n, 0n, 0, 100000n]
+          );
+        }
+      }
+      return '0x';
+    },
+    sendSignedTxAndWait: async ({ chain, to, data }) => {
+      sentTxs.push({ chain, to, data });
+      return {
+        txHash: `0x${String(sentTxs.length).padStart(64, 'e')}`,
+        receipt: { status: 1, blockNumber: 500, gasUsed: 150000n, effectiveGasPrice: 100000000n },
+      };
+    },
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(ethCallSelectors.includes('0x414bf389'), false); // skipped SwapRouter eth_call when allowance === 0
+  assert.equal(ethCallSelectors.includes('0x04e45aaf'), false);
+  assert.equal(ethCallSelectors.filter((s) => s === '0xc6a5026a').length, 2); // QuoterV2 simulated both legs
+  assert.equal(sentTxs.length, 5); // 2 approvals + 2 swaps + 1 vault sweep
+  assert.equal(Number(res.trade?.realizedProfitAmount), 400);
+});

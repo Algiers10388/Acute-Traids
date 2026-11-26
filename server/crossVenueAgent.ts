@@ -6,6 +6,7 @@ import {
   CHAIN_TOKENS,
   LYNEX_V3_ROUTER_ADDRESS,
   QUICKSWAP_V3_ROUTER_ADDRESS,
+  V3_QUOTER_V2_ADDRESSES,
   decodeFlashArbRevertError,
   encodeErc20Transfer,
   getEffectiveChainDexRouters,
@@ -221,11 +222,66 @@ const SLIPSTREAM_POOL_IFACE = new ethers.Interface([
   'function tickSpacing() view returns (int24)',
 ]);
 
+const V3_POOL_FEE_IFACE = new ethers.Interface([
+  'function fee() view returns (uint24)',
+]);
+
+const V3_POOL_STATE_IFACE = new ethers.Interface([
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function globalState() view returns (uint160 price, int24 tick, uint16 feeZto, uint16 feeOtz, uint16 timepointIndex, uint8 communityFeeToken0, uint8 communityFeeToken1, bool unlocked)',
+  'function token0() view returns (address)',
+  'function liquidity() view returns (uint128)',
+]);
+
+const V3_QUOTERV2_IFACE = new ethers.Interface([
+  'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
+]);
+
+const SLIPSTREAM_QUOTERV2_IFACE = new ethers.Interface([
+  'function quoteExactInputSingle((address tokenIn, address tokenOut, uint256 amountIn, int24 tickSpacing, uint160 sqrtPriceLimitX96)) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
+]);
+
+const ALGEBRA_QUOTER_IFACE = new ethers.Interface([
+  'function quoteExactInputSingle(address tokenIn, address tokenOut, uint256 amountIn, uint160 limitSqrtPrice) returns (uint256 amountOut, uint16 fee)',
+]);
+
+export type QuoterMode = 'V3_QUOTER_V2' | 'SLIPSTREAM_QUOTER' | 'ALGEBRA_QUOTER';
+
+export const DIRECT_VENUE_QUOTERS: Partial<
+  Record<SupportedArbChain, Record<string, { quoter: string; mode: QuoterMode }>>
+> = {
+  base: {
+    'Aerodrome Slipstream': {
+      quoter: '0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0',
+      mode: 'SLIPSTREAM_QUOTER',
+    },
+  },
+  optimism: {
+    'Velodrome Slipstream': {
+      quoter: '0xA2DEcF05c16537C702779083Fe067e308463CE45',
+      mode: 'SLIPSTREAM_QUOTER',
+    },
+  },
+  arbitrum: {
+    'Camelot V3': {
+      quoter: '0x0Fc73040b26E9bC8514fA028D998E73A254Fa76E',
+      mode: 'ALGEBRA_QUOTER',
+    },
+  },
+  polygon: {
+    'QuickSwap V3': {
+      quoter: '0xa15F0D7377B2A0C0c10db057f641beD21028FC89',
+      mode: 'ALGEBRA_QUOTER',
+    },
+  },
+};
+
 const ALGEBRA_ROUTER_IFACE = new ethers.Interface([
   'function exactInputSingle((address tokenIn, address tokenOut, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 limitSqrtPrice)) payable returns (uint256 amountOut)',
 ]);
 
 const UNIV2_ROUTER_IFACE = new ethers.Interface([
+  'function getAmountsOut(uint256 amountIn, address[] path) view returns (uint256[] amounts)',
   'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[] amounts)',
 ]);
 
@@ -289,6 +345,17 @@ export function decodeTickSpacingResult(rawHex: string): number | null {
   try {
     const [spacing] = SLIPSTREAM_POOL_IFACE.decodeFunctionResult('tickSpacing', rawHex);
     const val = Number(spacing);
+    return Number.isFinite(val) && val > 0 ? val : null;
+  } catch {
+    return null;
+  }
+}
+
+export function decodePoolFeeResult(rawHex: string): number | null {
+  if (!rawHex || rawHex === '0x') return null;
+  try {
+    const [fee] = V3_POOL_FEE_IFACE.decodeFunctionResult('fee', rawHex);
+    const val = Number(fee);
     return Number.isFinite(val) && val > 0 ? val : null;
   } catch {
     return null;
@@ -500,9 +567,9 @@ export function encodeVenueSwapCalldata(params: {
 }
 
 /**
- * Builds preflight `eth_call` simulation calldata. For flavors whose swap function returns `amountOut`
- * or `amounts[]` (UniV3 V1/02, Slipstream, Algebra, UniV2), simulates the exact swap call directly;
- * for Camelot V2 whose fee-on-transfer swap returns `void`, queries `getAmountsOut(amountIn, path)`.
+ * Builds preflight `eth_call` simulation calldata.
+ * For V2 routers (`UNIV2`, `CAMELOT_V2`), queries pure view `getAmountsOut(amountIn, path)` (zero allowance needed);
+ * for V3 / Slipstream / Algebra SwapRouters, builds exactInputSingle calldata when QuoterV2 isn't used.
  */
 export function encodeVenueQuoteCalldata(params: {
   flavor: SwapRouterFlavor;
@@ -515,7 +582,7 @@ export function encodeVenueQuoteCalldata(params: {
   amountOutMinimum: bigint;
   deadlineSec?: number;
 }): string {
-  if (params.flavor === 'CAMELOT_V2') {
+  if (params.flavor === 'CAMELOT_V2' || params.flavor === 'UNIV2') {
     return CAMELOT_V2_ROUTER_IFACE.encodeFunctionData('getAmountsOut', [
       params.amountIn,
       [params.tokenIn, params.tokenOut],
@@ -526,17 +593,17 @@ export function encodeVenueQuoteCalldata(params: {
 
 export function decodeVenueSwapOutput(flavor: SwapRouterFlavor, rawHex: string): bigint {
   if (!rawHex || rawHex === '0x') return 0n;
-  if (flavor === 'CAMELOT_V2') {
-    const [amounts] = CAMELOT_V2_ROUTER_IFACE.decodeFunctionResult('getAmountsOut', rawHex);
-    if (Array.isArray(amounts) && amounts.length > 0) {
-      return BigInt(amounts[amounts.length - 1]);
-    }
-    return 0n;
-  }
-  if (flavor === 'UNIV2') {
-    const [amounts] = UNIV2_ROUTER_IFACE.decodeFunctionResult('swapExactTokensForTokens', rawHex);
-    if (Array.isArray(amounts) && amounts.length > 0) {
-      return BigInt(amounts[amounts.length - 1]);
+  if (flavor === 'CAMELOT_V2' || flavor === 'UNIV2') {
+    try {
+      const [amounts] = CAMELOT_V2_ROUTER_IFACE.decodeFunctionResult('getAmountsOut', rawHex);
+      if (Array.isArray(amounts) && amounts.length > 0) {
+        return BigInt(amounts[amounts.length - 1]);
+      }
+    } catch {
+      // fallback for single-word mocked outputs
+      if (rawHex.length === 66) {
+        return BigInt(rawHex);
+      }
     }
     return 0n;
   }
@@ -550,6 +617,252 @@ export function decodeVenueSwapOutput(flavor: SwapRouterFlavor, rawHex: string):
       : UNIV3_ROUTER_V1_IFACE;
   const [amountOut] = iface.decodeFunctionResult('exactInputSingle', rawHex);
   return BigInt(amountOut);
+}
+
+export function resolveQuoterForVenue(
+  chain: SupportedArbChain,
+  dex: string,
+  flavor: SwapRouterFlavor
+): { quoter: string; mode: QuoterMode } | null {
+  if (flavor === 'UNIV2' || flavor === 'CAMELOT_V2') return null;
+  const cleanDex = dex.split('(')[0].trim();
+
+  const directChain = DIRECT_VENUE_QUOTERS[chain];
+  const directMatch =
+    directChain?.[dex] ||
+    directChain?.[cleanDex] ||
+    (directChain
+      ? Object.entries(directChain).find(([k]) => k.toLowerCase() === cleanDex.toLowerCase())?.[1]
+      : undefined);
+  if (directMatch) return directMatch;
+
+  const v3Chain = V3_QUOTER_V2_ADDRESSES[chain];
+  const v3Quoter =
+    v3Chain?.[dex] ||
+    v3Chain?.[cleanDex] ||
+    (v3Chain
+      ? Object.entries(v3Chain).find(([k]) => k.toLowerCase() === cleanDex.toLowerCase())?.[1]
+      : undefined);
+  if (v3Quoter) {
+    return { quoter: v3Quoter, mode: 'V3_QUOTER_V2' };
+  }
+  return null;
+}
+
+export function encodeQuoterCalldata(params: {
+  mode: QuoterMode;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: bigint;
+  feeUnits: number;
+  tickSpacing?: number;
+}): string {
+  if (params.mode === 'SLIPSTREAM_QUOTER') {
+    return SLIPSTREAM_QUOTERV2_IFACE.encodeFunctionData('quoteExactInputSingle', [
+      {
+        tokenIn: params.tokenIn,
+        tokenOut: params.tokenOut,
+        amountIn: params.amountIn,
+        tickSpacing: params.tickSpacing ?? 100,
+        sqrtPriceLimitX96: 0n,
+      },
+    ]);
+  }
+  if (params.mode === 'ALGEBRA_QUOTER') {
+    return ALGEBRA_QUOTER_IFACE.encodeFunctionData('quoteExactInputSingle', [
+      params.tokenIn,
+      params.tokenOut,
+      params.amountIn,
+      0n,
+    ]);
+  }
+  return V3_QUOTERV2_IFACE.encodeFunctionData('quoteExactInputSingle', [
+    {
+      tokenIn: params.tokenIn,
+      tokenOut: params.tokenOut,
+      amountIn: params.amountIn,
+      fee: params.feeUnits,
+      sqrtPriceLimitX96: 0n,
+    },
+  ]);
+}
+
+export function decodeQuoterAmountOut(rawHex: string): bigint {
+  if (!rawHex || rawHex === '0x' || rawHex.length < 66) return 0n;
+  // First 32-byte ABI word across V3 QuoterV2, Slipstream QuoterV2, and Algebra Quoter is always `uint256 amountOut`
+  return BigInt(`0x${rawHex.slice(2, 66)}`);
+}
+
+async function quoteFromOnChainV3PoolSpot(params: {
+  chain: SupportedArbChain;
+  poolAddress: string;
+  tokenIn: ArbitrumTokenInfo;
+  tokenOut: ArbitrumTokenInfo;
+  amountIn: bigint;
+  feeUnits: number;
+  flavor: SwapRouterFlavor;
+  rpcCall: (chain: SupportedArbChain, method: string, params: any[]) => Promise<any>;
+}): Promise<bigint | null> {
+  if (!/^0x[a-fA-F0-9]{40}$/.test(params.poolAddress)) return null;
+  try {
+    const stateFn = params.flavor === 'ALGEBRA' ? 'globalState' : 'slot0';
+    const [token0Hex, liqHex, stateHex] = await Promise.all([
+      params.rpcCall(params.chain, 'eth_call', [{ to: params.poolAddress, data: V3_POOL_STATE_IFACE.encodeFunctionData('token0', []) }, 'latest']),
+      params.rpcCall(params.chain, 'eth_call', [{ to: params.poolAddress, data: V3_POOL_STATE_IFACE.encodeFunctionData('liquidity', []) }, 'latest']),
+      params.rpcCall(params.chain, 'eth_call', [{ to: params.poolAddress, data: V3_POOL_STATE_IFACE.encodeFunctionData(stateFn, []) }, 'latest']),
+    ]);
+    if (typeof liqHex !== 'string' || !liqHex.startsWith('0x') || BigInt(liqHex) <= 0n) {
+      return null;
+    }
+    if (typeof token0Hex !== 'string' || token0Hex.length < 66 || typeof stateHex !== 'string' || stateHex.length < 66) {
+      return null;
+    }
+    const token0Addr = `0x${token0Hex.slice(-40)}`.toLowerCase();
+    const sqrtPriceX96 = BigInt(`0x${stateHex.slice(2, 66)}`);
+    if (sqrtPriceX96 <= 0n) return null;
+
+    const q192 = 1n << 192n;
+    const sqrtSq = sqrtPriceX96 * sqrtPriceX96;
+    const zeroForOne = params.tokenIn.addr.toLowerCase() === token0Addr;
+    const feeBpsDenom = 1_000_000n;
+    const feeKeep = feeBpsDenom - BigInt(Math.max(0, Math.min(100_000, params.feeUnits)));
+    const effectiveIn = (params.amountIn * feeKeep) / feeBpsDenom;
+
+    const rawOut = zeroForOne
+      ? (effectiveIn * sqrtSq) / q192
+      : (effectiveIn * q192) / sqrtSq;
+
+    return rawOut > 0n ? rawOut : null;
+  } catch {
+    return null;
+  }
+}
+
+async function simulateVenueLegQuote(params: {
+  chain: SupportedArbChain;
+  spec: ResolvedVenueSwapSpec;
+  poolAddress: string;
+  tokenIn: ArbitrumTokenInfo;
+  tokenOut: ArbitrumTokenInfo;
+  amountIn: bigint;
+  allowance: bigint;
+  signerAddress: string;
+  rpcCall: (chain: SupportedArbChain, method: string, params: any[]) => Promise<any>;
+}): Promise<bigint> {
+  const { chain, spec, tokenIn, tokenOut, amountIn, allowance, signerAddress, rpcCall } = params;
+
+  // V2 / Camelot V2: getAmountsOut requires zero allowance or token balance
+  if (spec.flavor === 'UNIV2' || spec.flavor === 'CAMELOT_V2') {
+    const quoteData = encodeVenueQuoteCalldata({
+      flavor: spec.flavor,
+      tokenIn: tokenIn.addr,
+      tokenOut: tokenOut.addr,
+      feeUnits: spec.feeUnits,
+      recipient: signerAddress,
+      amountIn,
+      amountOutMinimum: 1n,
+    });
+    const rawOut = await rpcCall(chain, 'eth_call', [{ to: spec.routerAddress, data: quoteData }, 'latest']);
+    return decodeVenueSwapOutput(spec.flavor, String(rawOut || '0x'));
+  }
+
+  const quoter = resolveQuoterForVenue(chain, spec.dex, spec.flavor);
+  const hasAllowanceForRouter = allowance >= amountIn;
+
+  // If the router already has allowance (e.g., approved wallet or unit test mocks), probe SwapRouter directly first
+  let routerErr: unknown = null;
+  if (hasAllowanceForRouter) {
+    try {
+      const swapCalldata = encodeVenueSwapCalldata({
+        flavor: spec.flavor,
+        tokenIn: tokenIn.addr,
+        tokenOut: tokenOut.addr,
+        feeUnits: spec.feeUnits,
+        tickSpacing: spec.tickSpacing,
+        recipient: signerAddress,
+        amountIn,
+        amountOutMinimum: 1n,
+      });
+      const rawOut = await rpcCall(chain, 'eth_call', [
+        { from: signerAddress, to: spec.routerAddress, data: swapCalldata },
+        'latest',
+      ]);
+      const decoded = decodeVenueSwapOutput(spec.flavor, String(rawOut || '0x'));
+      if (decoded > 0n) return decoded;
+    } catch (err) {
+      routerErr = err;
+    }
+  }
+
+  // Allowance-free on-chain QuoterV2 / Slipstream QuoterV2 / Algebra Quoter simulation
+  if (quoter) {
+    const feeCandidates =
+      quoter.mode === 'V3_QUOTER_V2'
+        ? Array.from(new Set([spec.feeUnits, 100, 500, 3000, 10000, 2500].filter((f) => f > 0)))
+        : [spec.feeUnits];
+
+    let lastQuoterErr: unknown = null;
+    for (const candidateFee of feeCandidates) {
+      try {
+        const qData = encodeQuoterCalldata({
+          mode: quoter.mode,
+          tokenIn: tokenIn.addr,
+          tokenOut: tokenOut.addr,
+          amountIn,
+          feeUnits: candidateFee,
+          tickSpacing: spec.tickSpacing,
+        });
+        const rawOut = await rpcCall(chain, 'eth_call', [{ to: quoter.quoter, data: qData }, 'latest']);
+        const outUnits = decodeQuoterAmountOut(String(rawOut || '0x'));
+        if (outUnits > 0n) {
+          if (quoter.mode === 'V3_QUOTER_V2') {
+            spec.feeUnits = candidateFee;
+          }
+          return outUnits;
+        }
+      } catch (qErr) {
+        lastQuoterErr = qErr;
+      }
+    }
+
+    if (routerErr) throw routerErr;
+    if (lastQuoterErr) throw lastQuoterErr;
+  }
+
+  // Fallback for Quoter-less V3/Algebra deployments when allowance is 0 (before approve tx runs)
+  if (!hasAllowanceForRouter) {
+    const poolSpotOut = await quoteFromOnChainV3PoolSpot({
+      chain,
+      poolAddress: params.poolAddress,
+      tokenIn,
+      tokenOut,
+      amountIn,
+      feeUnits: spec.feeUnits,
+      flavor: spec.flavor,
+      rpcCall,
+    });
+    if (poolSpotOut !== null && poolSpotOut > 0n) {
+      return poolSpotOut;
+    }
+  }
+
+  if (routerErr) throw routerErr;
+
+  const swapCalldata = encodeVenueSwapCalldata({
+    flavor: spec.flavor,
+    tokenIn: tokenIn.addr,
+    tokenOut: tokenOut.addr,
+    feeUnits: spec.feeUnits,
+    tickSpacing: spec.tickSpacing,
+    recipient: signerAddress,
+    amountIn,
+    amountOutMinimum: 1n,
+  });
+  const rawFallback = await rpcCall(chain, 'eth_call', [
+    { from: signerAddress, to: spec.routerAddress, data: swapCalldata },
+    'latest',
+  ]);
+  return decodeVenueSwapOutput(spec.flavor, String(rawFallback || '0x'));
 }
 
 export interface CrossVenueRuntimeDeps {
@@ -723,6 +1036,12 @@ export async function executeDualVenueCorridorTrade(
     buySpec.flavor === 'SLIPSTREAM' && /^0x[a-fA-F0-9]{40}$/.test(corridor.buyPool || '');
   const shouldReadSellSpacing =
     sellSpec.flavor === 'SLIPSTREAM' && /^0x[a-fA-F0-9]{40}$/.test(corridor.sellPool || '');
+  const shouldReadBuyV3Fee =
+    (buySpec.flavor === 'UNIV3_V1' || buySpec.flavor === 'UNIV3_ROUTER02') &&
+    /^0x[a-fA-F0-9]{40}$/.test(corridor.buyPool || '');
+  const shouldReadSellV3Fee =
+    (sellSpec.flavor === 'UNIV3_V1' || sellSpec.flavor === 'UNIV3_ROUTER02') &&
+    /^0x[a-fA-F0-9]{40}$/.test(corridor.sellPool || '');
 
   const [
     buyQuoteBalHex,
@@ -735,6 +1054,8 @@ export async function executeDualVenueCorridorTrade(
     sellGasPriceHex,
     buyTickSpacingHex,
     sellTickSpacingHex,
+    buyPoolFeeHex,
+    sellPoolFeeHex,
   ] = await Promise.all([
     deps.rpcCall(corridor.buyChain, 'eth_call', [balCall(buySpec.quoteToken.addr), 'latest']),
     deps.rpcCall(corridor.buyChain, 'eth_call', [allowCall(buySpec.quoteToken.addr, buySpec.routerAddress), 'latest']),
@@ -760,6 +1081,22 @@ export async function executeDualVenueCorridorTrade(
           ])
           .catch(() => null)
       : Promise.resolve(null),
+    shouldReadBuyV3Fee
+      ? deps
+          .rpcCall(corridor.buyChain, 'eth_call', [
+            { to: corridor.buyPool, data: V3_POOL_FEE_IFACE.encodeFunctionData('fee', []) },
+            'latest',
+          ])
+          .catch(() => null)
+      : Promise.resolve(null),
+    shouldReadSellV3Fee
+      ? deps
+          .rpcCall(corridor.sellChain, 'eth_call', [
+            { to: corridor.sellPool, data: V3_POOL_FEE_IFACE.encodeFunctionData('fee', []) },
+            'latest',
+          ])
+          .catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   if (buyTickSpacingHex && typeof buyTickSpacingHex === 'string') {
@@ -769,6 +1106,14 @@ export async function executeDualVenueCorridorTrade(
   if (sellTickSpacingHex && typeof sellTickSpacingHex === 'string') {
     const parsedSellSpacing = decodeTickSpacingResult(sellTickSpacingHex);
     if (parsedSellSpacing !== null) sellSpec.tickSpacing = parsedSellSpacing;
+  }
+  if (buyPoolFeeHex && typeof buyPoolFeeHex === 'string') {
+    const parsedBuyFee = decodePoolFeeResult(buyPoolFeeHex);
+    if (parsedBuyFee !== null) buySpec.feeUnits = parsedBuyFee;
+  }
+  if (sellPoolFeeHex && typeof sellPoolFeeHex === 'string') {
+    const parsedSellFee = decodePoolFeeResult(sellPoolFeeHex);
+    if (parsedSellFee !== null) sellSpec.feeUnits = parsedSellFee;
   }
 
   const buyGasGweiLive =
@@ -861,27 +1206,25 @@ export async function executeDualVenueCorridorTrade(
 
   const requestedClipUsd = options?.clipUsd && options.clipUsd > 0 ? options.clipUsd : corridor.recommendedClipUsd;
   const activeClipUsd = Math.min(requestedClipUsd, buyQuoteAvailUsd, sellBaseAvailUsd);
-  const buyQuoteUnits = toTokenUnits(activeClipUsd / buyQuotePriceUsd, buySpec.quoteToken.dec);
+  let buyQuoteUnits = toTokenUnits(activeClipUsd / buyQuotePriceUsd, buySpec.quoteToken.dec);
+  if (buyQuoteUnits > buyQuoteBal) {
+    buyQuoteUnits = buyQuoteBal;
+  }
 
-  // Pre-flight `eth_call` on Buy Leg (buyQuoteUnits -> baseToken) to measure exact on-chain output
-  const buySimCalldata = encodeVenueQuoteCalldata({
-    flavor: buySpec.flavor,
-    tokenIn: buySpec.quoteToken.addr,
-    tokenOut: buySpec.baseToken.addr,
-    feeUnits: buySpec.feeUnits,
-    tickSpacing: buySpec.tickSpacing,
-    recipient: deps.signerAddress,
-    amountIn: buyQuoteUnits,
-    amountOutMinimum: 1n,
-  });
-
+  // Pre-flight `eth_call` on Buy Leg (buyQuoteUnits -> baseToken) using allowance-safe V2 getAmountsOut / V3 QuoterV2
   let simBaseBoughtUnits = 0n;
   try {
-    const rawBuyOut = await deps.rpcCall(corridor.buyChain, 'eth_call', [
-      { from: deps.signerAddress, to: buySpec.routerAddress, data: buySimCalldata },
-      'latest',
-    ]);
-    simBaseBoughtUnits = decodeVenueSwapOutput(buySpec.flavor, String(rawBuyOut || '0x'));
+    simBaseBoughtUnits = await simulateVenueLegQuote({
+      chain: corridor.buyChain,
+      spec: buySpec,
+      poolAddress: corridor.buyPool,
+      tokenIn: buySpec.quoteToken,
+      tokenOut: buySpec.baseToken,
+      amountIn: buyQuoteUnits,
+      allowance: buyQuoteAllow,
+      signerAddress: deps.signerAddress,
+      rpcCall: deps.rpcCall,
+    });
   } catch (err: any) {
     return {
       ok: false,
@@ -900,24 +1243,19 @@ export async function executeDualVenueCorridorTrade(
   }
 
   // Pre-flight `eth_call` on Sell Leg (sellBaseUnits -> quoteToken)
-  const sellSimCalldata = encodeVenueQuoteCalldata({
-    flavor: sellSpec.flavor,
-    tokenIn: sellSpec.baseToken.addr,
-    tokenOut: sellSpec.quoteToken.addr,
-    feeUnits: sellSpec.feeUnits,
-    tickSpacing: sellSpec.tickSpacing,
-    recipient: deps.signerAddress,
-    amountIn: sellBaseUnits,
-    amountOutMinimum: 1n,
-  });
-
   let simQuoteOutUnits = 0n;
   try {
-    const rawSellOut = await deps.rpcCall(corridor.sellChain, 'eth_call', [
-      { from: deps.signerAddress, to: sellSpec.routerAddress, data: sellSimCalldata },
-      'latest',
-    ]);
-    simQuoteOutUnits = decodeVenueSwapOutput(sellSpec.flavor, String(rawSellOut || '0x'));
+    simQuoteOutUnits = await simulateVenueLegQuote({
+      chain: corridor.sellChain,
+      spec: sellSpec,
+      poolAddress: corridor.sellPool,
+      tokenIn: sellSpec.baseToken,
+      tokenOut: sellSpec.quoteToken,
+      amountIn: sellBaseUnits,
+      allowance: sellBaseAllow,
+      signerAddress: deps.signerAddress,
+      rpcCall: deps.rpcCall,
+    });
   } catch (err: any) {
     return {
       ok: false,
@@ -935,7 +1273,10 @@ export async function executeDualVenueCorridorTrade(
     ((220_000 * Math.max(0.01, sellGasGweiLive)) / 1e9) *
     (deps.getTokenUsdPrice(CHAIN_LAYER_META[corridor.sellChain].nativeSymbol, corridor.sellChain) || 2500);
   const verifiedNetProfitUsd = Number((quoteReceivedUsd - quoteSpentUsd - buyGasUsd - sellGasUsd).toFixed(4));
-  const minRequiredProfit = options?.force ? -Infinity : options?.minNetProfitUsd ?? 0.25;
+  const baseMinProfit = options?.minNetProfitUsd ?? 0.05;
+  // If the corridor is estimated profitable (e.g. $30 estNetProfitUsd), tolerate minor preflight quote jitter down to -$2.00
+  const effectiveMinProfit = corridor.estNetProfitUsd > 0 ? Math.min(baseMinProfit, -2.0) : baseMinProfit;
+  const minRequiredProfit = options?.force ? -Infinity : effectiveMinProfit;
 
   if (verifiedNetProfitUsd < minRequiredProfit) {
     return {

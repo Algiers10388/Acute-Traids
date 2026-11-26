@@ -2189,6 +2189,8 @@ function AppInner({ initialAssets, initialCandles }: { initialAssets: CryptoAsse
           orders={orders}
           onClosePosition={(id) => closePosition(id, 'MANUAL_CLOSE', 'Closed by User')}
           botLogs={botLogs}
+          selectedSymbol={selectedSymbol}
+          candles={activeCandles}
         />
       </main>
     </>

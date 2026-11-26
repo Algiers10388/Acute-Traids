@@ -280,77 +280,74 @@ Status:             ${tx.status}
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 overflow-y-auto">
       <div className="bg-slate-900 border border-slate-700/80 w-full max-w-6xl xl:max-w-7xl rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[94vh]">
         {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-gradient-to-br from-emerald-500/20 via-teal-500/20 to-cyan-500/20 border border-emerald-500/30 text-emerald-400">
-              <Landmark className="h-5 w-5" />
+        <div className="px-4 py-2.5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-gradient-to-br from-emerald-500/20 via-teal-500/20 to-cyan-500/20 border border-emerald-500/30 text-emerald-400">
+              <Landmark className="h-4 w-4" />
             </div>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
-                <h2 className="text-base font-bold text-white tracking-tight">Live Currency Account & Banking Rail</h2>
-                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold font-mono uppercase flex items-center gap-1 border ${
+                <h2 className="text-sm font-bold text-white tracking-tight">Live Currency Account & Banking Rail</h2>
+                <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold font-mono uppercase flex items-center gap-1 border ${
                   fiatAccount.twoFactorEnabled
                     ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
                     : 'bg-amber-500/10 text-amber-300 border-amber-500/30'
                 }`}>
-                  <ShieldCheck className="h-3 w-3" />
+                  <ShieldCheck className="h-2.5 w-2.5" />
                   {fiatAccount.twoFactorEnabled ? '2FA Active' : '2FA Setup Needed'}
                 </span>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/30">
+                <span className="px-2 py-0.5 rounded-full text-[9px] font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/30">
                   Live Stripe & PayPal
                 </span>
               </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Live USD ledger with Stripe card deposits, Plaid + Stripe ACH bank linking, and PayPal payouts.
-              </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-all cursor-pointer"
+            className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-all cursor-pointer"
           >
-            <X className="h-5 w-5" />
+            <X className="h-4 w-4" />
           </button>
         </div>
 
         {/* Balance Overview Banner */}
-        <div className="px-6 py-4 bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 border-b border-slate-800 grid grid-cols-2 sm:grid-cols-4 gap-4">
-          <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
-            <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Available Fiat Cash</div>
-            <div className="text-xl font-black text-emerald-400 font-mono mt-0.5">
+        <div className="px-4 py-2.5 bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 border-b border-slate-800 grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+          <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800">
+            <div className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Available Fiat Cash</div>
+            <div className="text-base font-black text-emerald-400 font-mono mt-0.5">
               {formatCurrency(fiatAccount.availableBalance)}
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">
+            <div className="text-[9px] text-slate-500 mt-0.5">
               {fiatAccount.pendingBalance > 0
                 ? <span className="text-amber-300 font-mono">Pending: {formatCurrency(fiatAccount.pendingBalance)}</span>
                 : 'USD Ledger (Settled)'}
             </div>
           </div>
 
-          <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
-            <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Allocated to Bot</div>
-            <div className="text-xl font-black text-cyan-400 font-mono mt-0.5">
+          <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800">
+            <div className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Allocated to Bot</div>
+            <div className="text-base font-black text-cyan-400 font-mono mt-0.5">
               {formatCurrency(fiatAccount.allocatedToTrading)}
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Active Trading Margin</div>
+            <div className="text-[9px] text-slate-500 mt-0.5">Active Trading Margin</div>
           </div>
 
-          <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
-            <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Connected Banks</div>
-            <div className="text-xl font-black text-white font-mono mt-0.5">
-              {fiatAccount.linkedBanks.length} <span className="text-xs font-normal text-slate-400">Linked</span>
+          <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800">
+            <div className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Connected Banks</div>
+            <div className="text-base font-black text-white font-mono mt-0.5">
+              {fiatAccount.linkedBanks.length} <span className="text-[11px] font-normal text-slate-400">Linked</span>
             </div>
-            <div className="text-[10px] text-emerald-400/80 mt-0.5 flex items-center gap-1">
+            <div className="text-[9px] text-emerald-400/80 mt-0.5 flex items-center gap-1">
               <CheckCircle2 className="h-2.5 w-2.5" /> {fiatAccount.linkedBanks.length > 0 ? 'Plaid + Stripe ACH' : 'No bank linked'}
             </div>
           </div>
 
-          <div className="bg-slate-900/80 p-3 rounded-xl border border-slate-800">
-            <div className="text-[10px] text-slate-400 uppercase tracking-wider font-mono">Daily Limit Remaining</div>
-            <div className="text-xl font-black text-slate-200 font-mono mt-0.5">
+          <div className="bg-slate-900/80 p-2.5 rounded-xl border border-slate-800">
+            <div className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Daily Limit Remaining</div>
+            <div className="text-base font-black text-slate-200 font-mono mt-0.5">
               ${Math.max(0, fiatAccount.dailyDepositLimit - fiatAccount.dailyDepositUsed).toLocaleString()}
             </div>
-            <div className="text-[10px] text-slate-500 mt-0.5">Limit: ${fiatAccount.dailyDepositLimit.toLocaleString()}/day</div>
+            <div className="text-[9px] text-slate-500 mt-0.5">Limit: ${fiatAccount.dailyDepositLimit.toLocaleString()}/day</div>
           </div>
         </div>
 
@@ -373,121 +370,121 @@ Status:             ${tx.status}
         )}
 
         {/* Navigation Tabs */}
-        <div className="flex border-b border-slate-800 px-6 bg-slate-950/70 overflow-x-auto text-xs font-semibold gap-2 py-3 scrollbar-thin">
+        <div className="flex border-b border-slate-800 px-4 bg-slate-950/70 overflow-x-auto text-[11px] font-semibold gap-1.5 py-2 scrollbar-thin">
           <button
             type="button"
             onClick={() => setActiveTab('FUND_BOT')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'FUND_BOT'
                 ? 'bg-amber-500/25 text-amber-200 border border-amber-500/60 shadow-md font-bold ring-1 ring-amber-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <Zap className="h-4 w-4 text-amber-400" />
-            <span className="text-xs">Fund Trading Bot</span>
-            <span className="text-[9px] bg-amber-500/30 text-amber-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Stripe &amp; Ledger
+            <Zap className="h-3.5 w-3.5 text-amber-400" />
+            <span>Fund Trading Bot</span>
+            <span className="text-[9px] bg-amber-500/30 text-amber-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
+              Stripe
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('CASH_CHECK')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'CASH_CHECK'
                 ? 'bg-emerald-500/20 text-white border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <FileCheck className="h-4 w-4 text-emerald-400" />
-            <span className="text-xs">Check Deposit</span>
+            <FileCheck className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Check Deposit</span>
             <span
-              className={`text-[9px] px-2 py-0.5 rounded-full font-mono font-bold ${
+              className={`text-[9px] px-1.5 py-0.2 rounded-full font-mono font-bold ${
                 checkRailInfo.active
                   ? 'bg-emerald-500/30 text-emerald-200'
                   : 'bg-amber-500/20 text-amber-300'
               }`}
             >
-              {checkRailInfo.active ? `Check 21 (${checkRailInfo.env || 'live'})` : 'Setup Required'}
+              {checkRailInfo.active ? 'Check 21' : 'Setup'}
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('SECURITY')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'SECURITY'
                 ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/60 shadow-md font-bold ring-1 ring-cyan-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <ShieldCheck className="h-4 w-4 text-cyan-400" />
-            <span className="text-xs">Bank &amp; Bot Security</span>
-            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              {fiatAccount.twoFactorEnabled ? '2FA Active' : 'Setup 2FA'}
+            <ShieldCheck className="h-3.5 w-3.5 text-cyan-400" />
+            <span>Security &amp; 2FA</span>
+            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
+              {fiatAccount.twoFactorEnabled ? 'Active' : 'Setup'}
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('WITHDRAW')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'WITHDRAW'
                 ? 'bg-rose-500/25 text-rose-200 border border-rose-500/60 shadow-md font-bold ring-1 ring-rose-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <ArrowUpFromLine className="h-4 w-4 text-rose-400" />
-            <span className="text-xs">Withdraw Funds</span>
-            <span className="text-[9px] bg-rose-500/30 text-rose-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              PayPal Payouts
+            <ArrowUpFromLine className="h-3.5 w-3.5 text-rose-400" />
+            <span>Withdraw</span>
+            <span className="text-[9px] bg-rose-500/30 text-rose-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
+              PayPal
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('CRYPTO_TO_CASH')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'CRYPTO_TO_CASH'
                 ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <Coins className="h-4 w-4 text-emerald-400" />
-            <span className="text-xs">Crypto-to-Cash</span>
-            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Spot → PayPal
+            <Coins className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Crypto → Cash</span>
+            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
+              Spot
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('VAULT_TRANSFER')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'VAULT_TRANSFER'
                 ? 'bg-cyan-500/25 text-cyan-200 border border-cyan-500/60 shadow-md font-bold ring-1 ring-cyan-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <Vault className="h-4 w-4 text-cyan-400" />
-            <span className="text-xs">Vault → Exchange</span>
-            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-bold">
-              Kraken / CEX
+            <Vault className="h-3.5 w-3.5 text-cyan-400" />
+            <span>Vault → CEX</span>
+            <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
+              Kraken
             </span>
           </button>
 
           <button
             type="button"
             onClick={() => setActiveTab('ADD_BANK')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl transition-all cursor-pointer whitespace-nowrap ${
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all cursor-pointer whitespace-nowrap ${
               activeTab === 'ADD_BANK'
                 ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-500/60 shadow-md font-bold ring-1 ring-emerald-500/40'
                 : 'text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent'
             }`}
           >
-            <Landmark className="h-4 w-4 text-emerald-400" />
-            <span className="text-xs">+ Link Bank</span>
-            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-2 py-0.5 rounded-full font-mono font-bold">
+            <Landmark className="h-3.5 w-3.5 text-emerald-400" />
+            <span>+ Link Bank</span>
+            <span className="text-[9px] bg-emerald-500/30 text-emerald-200 px-1.5 py-0.2 rounded-full font-mono font-bold">
               Plaid
             </span>
           </button>

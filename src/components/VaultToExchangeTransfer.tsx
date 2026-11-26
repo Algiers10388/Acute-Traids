@@ -7,6 +7,7 @@ import {
   Coins,
   Copy,
   ExternalLink,
+  Fuel,
   KeyRound,
   Loader2,
   RefreshCw,
@@ -20,10 +21,14 @@ import {
   confirmVaultTransferTx,
   fetchExchangeDepositAddress,
   fetchVaultChainBalances,
+  fundVaultSignerGas,
+  resolveVaultSignerInfo,
   transferVaultToExchange,
   type VaultChainBalances,
+  type VaultSignerGasInfo,
 } from '../services/exchangeApi';
 import { formatCurrency } from '../utils/cryptoMath';
+import { ContractRescueAgentPanel } from './ContractRescueAgentPanel';
 
 type TargetExchange = 'KRAKEN' | 'BINANCE' | 'COINBASE' | 'OKX' | 'NONKYC';
 
@@ -53,7 +58,16 @@ interface VaultToExchangeTransferProps {
   onTransferComplete?: (info: { txHash: string; exchange: string; asset: string; amount: string }) => void;
 }
 
-const DEFAULT_VAULT_ADDRESS = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+const DEFAULT_VAULT_ADDRESS = '0x5901B4B159Ea0Cab54effcbF00F0076c96AD898D';
+
+const DEPLOYED_CONTRACT_BY_CHAIN: Record<string, string> = {
+  ethereum: '0x5901B4B159Ea0Cab54effcbF00F0076c96AD898D',
+  arbitrum: '0xeee31ff9e69904b43c124095b6f33aa61505bcc2',
+  base: '0x37440674a814f24d9C6ea0990b272215D40c4512',
+  optimism: '0x738C8Eb31316B23d9b8A68B0c2658B456c932598',
+  polygon: '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC',
+  bsc: '0xBBA273E057cDa31bB359d8AA8749256246B6d0cC',
+};
 
 export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = ({
   defaultExchange = 'KRAKEN',
@@ -65,7 +79,7 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
 
   const [chain, setChain] = useState<string>('ethereum');
   const [exchange, setExchange] = useState<TargetExchange>(initialEx);
-  const [vaultSourceMode, setVaultSourceMode] = useState<'PROFIT_VAULT' | 'GAS_WALLET' | 'CUSTOM'>('PROFIT_VAULT');
+  const [vaultSourceMode, setVaultSourceMode] = useState<'DEPLOYED_CONTRACT' | 'PROFIT_VAULT' | 'GAS_WALLET' | 'CUSTOM'>('DEPLOYED_CONTRACT');
   const [customVaultAddress, setCustomVaultAddress] = useState<string>(DEFAULT_VAULT_ADDRESS);
 
   const [vaultBalances, setVaultBalances] = useState<VaultChainBalances | null>(null);
@@ -89,6 +103,18 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
   const [scanningWeb3, setScanningWeb3] = useState<boolean>(false);
   const [web3ScannedWallets, setWeb3ScannedWallets] = useState<Array<{ address: string; providerName: string; isMatch: boolean }> | null>(null);
   const [web3ScanError, setWeb3ScanError] = useState<string | null>(null);
+
+  // Add Gas Panel State
+  const [showAddGasPanel, setShowAddGasPanel] = useState<boolean>(false);
+  const [signerGasInfo, setSignerGasInfo] = useState<VaultSignerGasInfo | null>(null);
+  const [loadingSignerGas, setLoadingSignerGas] = useState<boolean>(false);
+  const [gasTargetAddress, setGasTargetAddress] = useState<string>('');
+  const [gasTopUpAmount, setGasTopUpAmount] = useState<string>('0.002');
+  const [fundingGasMode, setFundingGasMode] = useState<'WEB3' | 'SERVER' | null>(null);
+  const [gasFundError, setGasFundError] = useState<string | null>(null);
+  const [gasFundNotice, setGasFundNotice] = useState<string | null>(null);
+  const [copiedSignerAddr, setCopiedSignerAddr] = useState<boolean>(false);
+
   const [txReceipt, setTxReceipt] = useState<{
     txHash: string;
     explorerUrl: string;
@@ -108,6 +134,14 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
     if (vaultSourceMode === 'CUSTOM' && /^0x[a-fA-F0-9]{40}$/.test(customVaultAddress.trim())) {
       return customVaultAddress.trim();
     }
+    if (vaultSourceMode === 'DEPLOYED_CONTRACT') {
+      return (
+        DEPLOYED_CONTRACT_BY_CHAIN[chain] ||
+        (vaultBalances?.chain === chain ? vaultBalances?.knownContractForChain : null) ||
+        vaultBalances?.profitVaultDefault ||
+        DEFAULT_VAULT_ADDRESS
+      );
+    }
     if (vaultSourceMode === 'GAS_WALLET' && vaultBalances?.gasWalletDefault) {
       return vaultBalances.gasWalletDefault;
     }
@@ -115,7 +149,7 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
       return vaultBalances?.profitVaultDefault || DEFAULT_VAULT_ADDRESS;
     }
     return DEFAULT_VAULT_ADDRESS;
-  }, [vaultSourceMode, customVaultAddress, vaultBalances?.gasWalletDefault, vaultBalances?.profitVaultDefault]);
+  }, [vaultSourceMode, customVaultAddress, chain, vaultBalances?.chain, vaultBalances?.knownContractForChain, vaultBalances?.gasWalletDefault, vaultBalances?.profitVaultDefault]);
 
   const loadVaultBalances = useCallback(async () => {
     setLoadingBalances(true);
@@ -124,9 +158,11 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
       const requestedVault =
         vaultSourceMode === 'CUSTOM'
           ? customVaultAddress.trim() || undefined
-          : vaultSourceMode === 'GAS_WALLET'
-            ? vaultBalances?.gasWalletDefault || undefined
-            : undefined;
+          : vaultSourceMode === 'DEPLOYED_CONTRACT'
+            ? (DEPLOYED_CONTRACT_BY_CHAIN[chain] || vaultBalances?.knownContractForChain || DEFAULT_VAULT_ADDRESS)
+            : vaultSourceMode === 'GAS_WALLET'
+              ? vaultBalances?.gasWalletDefault || undefined
+              : undefined;
       if (vaultSourceMode === 'CUSTOM' && (!requestedVault || !/^0x[a-fA-F0-9]{40}$/.test(requestedVault))) {
         setLoadingBalances(false);
         return;
@@ -237,9 +273,59 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
     }
   };
 
+  const refreshSignerGasInfo = useCallback(
+    async (explicitAddress?: string) => {
+      const targetAddr =
+        explicitAddress?.trim() ||
+        gasTargetAddress.trim() ||
+        vaultBalances?.serverSignerAddress ||
+        vaultBalances?.gasWalletDefault ||
+        '';
+      if (!sourcePrivateKey.trim() && !/^0x[a-fA-F0-9]{40}$/.test(targetAddr)) {
+        return;
+      }
+      setLoadingSignerGas(true);
+      setGasFundError(null);
+      try {
+        const info = await resolveVaultSignerInfo({
+          chain,
+          ...(sourcePrivateKey.trim()
+            ? {
+                privateKey: sourcePrivateKey.trim(),
+                ...(sourcePassphrase ? { passphrase: sourcePassphrase } : {}),
+              }
+            : { signerAddress: targetAddr }),
+        });
+        setSignerGasInfo(info);
+        setGasTargetAddress(info.signerAddress);
+        setGasTopUpAmount((prev) =>
+          !prev || prev === '0.002' || prev === '0.0002' ? info.recommendedTopUp : prev
+        );
+      } catch (err: any) {
+        setGasFundError(err?.message || 'Unable to resolve signer gas balance.');
+      } finally {
+        setLoadingSignerGas(false);
+      }
+    },
+    [chain, gasTargetAddress, sourcePrivateKey, sourcePassphrase, vaultBalances?.serverSignerAddress, vaultBalances?.gasWalletDefault]
+  );
+
+  useEffect(() => {
+    if (sourcePrivateKey.trim()) {
+      const timer = setTimeout(() => {
+        void refreshSignerGasInfo();
+      }, 250);
+      return () => clearTimeout(timer);
+    } else if (showAddGasPanel) {
+      void refreshSignerGasInfo();
+    }
+  }, [chain, sourcePrivateKey, sourcePassphrase, showAddGasPanel]);
+
   const handleGenerateTempSigner = async () => {
     setError(null);
     setNotice(null);
+    setGasFundError(null);
+    setGasFundNotice(null);
     try {
       const currentVault = vaultBalances?.vaultAddress || activeVaultAddress || DEFAULT_VAULT_ADDRESS;
       const res = await fetch('/api/flash-arb/vault/generate-temp-signer', {
@@ -253,10 +339,109 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
       }
       setSourcePrivateKey(data.privateKey);
       setShowSignerInput(true);
-      // Keep source Vault address as currentVault (0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2)
-      setNotice(data.message || `Generated working temporary signer for Vault ${currentVault}`);
+      if (data.signerAddress && /^0x[a-fA-F0-9]{40}$/.test(data.signerAddress)) {
+        setGasTargetAddress(data.signerAddress);
+        setShowAddGasPanel(true);
+        void refreshSignerGasInfo(data.signerAddress);
+      }
+      setNotice(
+        data.signerAddress
+          ? `Generated temporary signer ${data.signerAddress} for Vault ${currentVault}. Add gas below if balance is 0.`
+          : data.message || `Generated working temporary signer for Vault ${currentVault}`
+      );
     } catch (err: any) {
       setError(err?.message || 'Failed to generate temporary signer.');
+    }
+  };
+
+  const handleFundGasViaWeb3 = async () => {
+    setGasFundError(null);
+    setGasFundNotice(null);
+    const recipient = (gasTargetAddress || signerGasInfo?.signerAddress || '').trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(recipient)) {
+      return setGasFundError('Enter or select a valid 0x... signer address to fund.');
+    }
+    const cleanTopUp = gasTopUpAmount.trim();
+    if (!/^\d+(\.\d+)?$/.test(cleanTopUp) || Number(cleanTopUp) <= 0) {
+      return setGasFundError('Enter a valid positive decimal gas amount (e.g. 0.002).');
+    }
+
+    setFundingGasMode('WEB3');
+    try {
+      const ethProvider = (window as any)?.ethereum;
+      if (!ethProvider?.request) {
+        throw new Error('No Web3 browser wallet detected (MetaMask, Rabby, Coinbase Wallet). Copy the signer address below to fund it from Kraken, Coinbase, or another wallet.');
+      }
+      const accounts: string[] = await ethProvider.request({ method: 'eth_requestAccounts' });
+      const fromAccount = accounts?.[0];
+      if (!fromAccount) {
+        throw new Error('No unlocked Web3 account available to send gas.');
+      }
+
+      const targetChainHex = vaultBalances?.chainIdHex || signerGasInfo?.chainIdHex;
+      if (targetChainHex) {
+        const currentChainId = await ethProvider.request({ method: 'eth_chainId' });
+        if (String(currentChainId).toLowerCase() !== targetChainHex.toLowerCase()) {
+          await ethProvider.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: targetChainHex }],
+          });
+        }
+      }
+
+      // Convert decimal amount cleanly to Wei hex without float drift
+      const [wholePart = '0', fracPart = ''] = cleanTopUp.split('.');
+      const weiBigInt = BigInt(wholePart || '0') * 10n ** 18n + BigInt((fracPart + '0'.repeat(18)).slice(0, 18));
+      const valueHex = `0x${weiBigInt.toString(16)}`;
+
+      setGasFundNotice(`Confirm gas top-up of ${cleanTopUp} in your Web3 wallet...`);
+      const txHash: string = await ethProvider.request({
+        method: 'eth_sendTransaction',
+        params: [
+          {
+            from: fromAccount,
+            to: recipient,
+            value: valueHex,
+          },
+        ],
+      });
+
+      setGasFundNotice(`Gas transfer submitted (${txHash.slice(0, 10)}...). Checking on-chain confirmation...`);
+      await refreshSignerGasInfo(recipient);
+      await loadVaultBalances();
+      setGasFundNotice(`Sent ${cleanTopUp} ${signerGasInfo?.nativeSymbol || 'ETH'} gas to ${recipient.slice(0, 6)}...${recipient.slice(-4)} (Tx ${txHash.slice(0, 10)}...).`);
+    } catch (err: any) {
+      setGasFundError(err?.message || 'Web3 gas transfer failed.');
+    } finally {
+      setFundingGasMode(null);
+    }
+  };
+
+  const handleFundGasFromServerWallet = async () => {
+    setGasFundError(null);
+    setGasFundNotice(null);
+    const recipient = (gasTargetAddress || signerGasInfo?.signerAddress || '').trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(recipient)) {
+      return setGasFundError('Enter or select a valid 0x... signer address to fund.');
+    }
+    const cleanAmt = gasTopUpAmount.trim();
+    if (!/^\d+(\.\d+)?$/.test(cleanAmt) || !(Number(cleanAmt) > 0)) {
+      return setGasFundError('Enter a valid positive decimal gas amount.');
+    }
+    setFundingGasMode('SERVER');
+    try {
+      const res = await fundVaultSignerGas({
+        chain,
+        targetAddress: recipient,
+        amount: cleanAmt,
+      });
+      setGasFundNotice(`${res.message} (${res.txHash.slice(0, 10)}...)`);
+      await refreshSignerGasInfo(recipient);
+      await loadVaultBalances();
+    } catch (err: any) {
+      setGasFundError(err?.message || 'Could not fund gas from server Gas Wallet.');
+    } finally {
+      setFundingGasMode(null);
     }
   };
 
@@ -343,10 +528,11 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
 
         // Request active Web3 accounts and ensure correct chain
         const accounts: string[] = await ethProvider.request({ method: 'eth_requestAccounts' });
-        const matchedAccount = accounts.find((a) => a.toLowerCase() === sourceAddr.toLowerCase());
+        const requiredSigner = (res.signerRequired || sourceAddr).toLowerCase();
+        const matchedAccount = accounts.find((a) => a.toLowerCase() === requiredSigner);
         if (!matchedAccount) {
           throw new Error(
-            `Connected Web3 wallet is ${accounts[0] || 'none'}, but transfer requires ${sourceAddr}. Switch accounts in MetaMask or supply the Vault Signer Key below.`
+            `Connected Web3 wallet is ${accounts[0] || 'none'}, but transfer requires ${res.signerRequired || sourceAddr}. Switch accounts in MetaMask or supply the Vault Signer Key below.`
           );
         }
 
@@ -358,7 +544,7 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
           });
         }
 
-        setNotice(`Waiting for Web3 wallet signature from ${sourceAddr.slice(0, 6)}...${sourceAddr.slice(-4)}...`);
+        setNotice(`Waiting for Web3 wallet signature from ${(res.signerRequired || sourceAddr).slice(0, 6)}...${(res.signerRequired || sourceAddr).slice(-4)}...`);
         const txHash: string = await ethProvider.request({
           method: 'eth_sendTransaction',
           params: [
@@ -424,15 +610,35 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={loadVaultBalances}
-          disabled={loadingBalances}
-          className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-50"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${loadingBalances ? 'animate-spin' : ''}`} />
-          <span>Sync Vault</span>
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              setShowAddGasPanel((v) => !v);
+              if (!showAddGasPanel) {
+                void refreshSignerGasInfo();
+              }
+            }}
+            className={`px-3 py-1.5 rounded-xl border text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all ${
+              showAddGasPanel
+                ? 'bg-amber-500/25 border-amber-400 text-amber-200'
+                : 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/40 text-amber-300'
+            }`}
+          >
+            <Fuel className="h-3.5 w-3.5" />
+            <span>Add Gas</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={loadVaultBalances}
+            disabled={loadingBalances}
+            className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loadingBalances ? 'animate-spin' : ''}`} />
+            <span>Sync Vault</span>
+          </button>
+        </div>
       </div>
 
       {/* Vault Source & Chain Selector */}
@@ -457,9 +663,10 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
           </div>
 
           <div>
-            <label className="block text-[10px] font-mono font-bold uppercase text-slate-400 mb-1">2. Source On-Chain Wallet</label>
-            <div className="flex gap-1.5">
+            <label className="block text-[10px] font-mono font-bold uppercase text-slate-400 mb-1">2. Source On-Chain Wallet / Contract</label>
+            <div className="flex flex-wrap gap-1.5">
               {[
+                { id: 'DEPLOYED_CONTRACT', label: 'FlashArb Contract' },
                 { id: 'PROFIT_VAULT', label: 'Profit Vault' },
                 ...(vaultBalances?.gasWalletDefault ? [{ id: 'GAS_WALLET', label: 'Gas Wallet' }] : []),
                 { id: 'CUSTOM', label: 'Custom EVM' },
@@ -467,16 +674,46 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
                 <button
                   key={opt.id}
                   type="button"
-                  onClick={() => setVaultSourceMode(opt.id as any)}
+                  onClick={() => {
+                    setVaultSourceMode(opt.id as any);
+                    setError(null);
+                  }}
                   className={`flex-1 py-2 px-2.5 rounded-xl text-xs font-mono font-bold border transition-all cursor-pointer ${
                     vaultSourceMode === opt.id
-                      ? 'bg-cyan-500/20 border-cyan-400 text-cyan-200'
+                      ? opt.id === 'DEPLOYED_CONTRACT'
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200'
+                        : 'bg-cyan-500/20 border-cyan-400 text-cyan-200'
                       : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-white'
                   }`}
                 >
                   {opt.label}
                 </button>
               ))}
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const ethProvider = (window as any)?.ethereum;
+                    if (!ethProvider?.request) {
+                      setError('No Web3 wallet extension detected (MetaMask, Rabby, Coinbase Wallet).');
+                      return;
+                    }
+                    const accounts: string[] = await ethProvider.request({ method: 'eth_requestAccounts' });
+                    if (accounts?.[0]) {
+                      setVaultSourceMode('CUSTOM');
+                      setCustomVaultAddress(accounts[0]);
+                      setError(null);
+                      setNotice(`Selected connected Web3 account ${accounts[0]} as Source Wallet.`);
+                    }
+                  } catch (e: any) {
+                    setError(e?.message || 'Failed to read connected Web3 account.');
+                  }
+                }}
+                className="py-2 px-2.5 rounded-xl text-xs font-mono font-bold border border-slate-700 bg-slate-900 hover:border-cyan-500/60 text-cyan-300 transition-all cursor-pointer"
+                title="Use your active MetaMask / Rabby / Coinbase Wallet address"
+              >
+                Connected Web3
+              </button>
             </div>
           </div>
         </div>
@@ -590,6 +827,71 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
               </div>
             )}
 
+            {vaultBalances.isSmartContract && vaultBalances.canContractRescue && (
+              <div className="p-2.5 rounded-lg bg-emerald-950/35 border border-emerald-500/40 text-[11px] font-sans text-emerald-200 space-y-1.5">
+                <div className="flex items-start gap-2">
+                  <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold text-emerald-300">
+                      Rescueable Smart-Contract Vault Ready ({vaultBalances.vaultAddress})
+                    </span>
+                    <p className="text-[10px] text-slate-300 mt-0.5 leading-relaxed">
+                      Owner: <code className="text-cyan-300 font-mono">{vaultBalances.contractOwner}</code>. Transfers from this contract execute on-chain via{' '}
+                      <code className="text-emerald-300 font-mono">
+                        {vaultBalances.hasRescueTokensTo ? 'rescueTokensTo(token, recipient)' : 'executeDirectFlashArb(recipient)'}
+                      </code>{' '}
+                      when signed by the contract owner (click <b>MAX</b> for ERC-20 token withdrawals).
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {vaultBalances.isSmartContract && !vaultBalances.canContractRescue && (
+              <div className="p-2.5 rounded-lg bg-rose-950/40 border border-rose-500/40 text-[11px] font-sans text-rose-200 space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold text-rose-300">
+                      {vaultBalances.vaultAddress} is an immutable token/external smart contract without owner rescue functions.
+                    </span>
+                    <p className="text-[10px] text-slate-300 mt-0.5 leading-relaxed">
+                      Public contracts like WETH9 have no <code className="text-cyan-300 font-mono">owner()</code> or <code className="text-cyan-300 font-mono">rescueTokensTo()</code> method, so Ethereum does not allow any key to withdraw funds held at this contract address. To transfer assets from a contract you own or from your wallet, switch below:
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2 font-mono text-[10px]">
+                  {vaultBalances.knownContractForChain && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setVaultSourceMode('CUSTOM');
+                        setCustomVaultAddress(vaultBalances.knownContractForChain || '');
+                        setError(null);
+                      }}
+                      className="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200 font-bold cursor-pointer transition-all"
+                    >
+                      Use Deployed FlashArb Contract ({vaultBalances.knownContractForChain.slice(0, 6)}...{vaultBalances.knownContractForChain.slice(-4)})
+                    </button>
+                  )}
+                  {signerGasInfo?.signerAddress &&
+                    signerGasInfo.signerAddress.toLowerCase() !== vaultBalances.vaultAddress.toLowerCase() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setVaultSourceMode('CUSTOM');
+                          setCustomVaultAddress(signerGasInfo.signerAddress);
+                          setError(null);
+                        }}
+                        className="px-2.5 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-bold cursor-pointer transition-all"
+                      >
+                        Switch Source Wallet to Signer ({signerGasInfo.signerAddress.slice(0, 6)}...{signerGasInfo.signerAddress.slice(-4)})
+                      </button>
+                    )}
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap gap-1.5">
               {selectableAssets.slice(0, 8).map((item) => {
                 const isSelected = currentAssetInfo?.symbol.toUpperCase() === item.symbol.toUpperCase();
@@ -677,6 +979,156 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
             </div>
           )}
         </div>
+
+        {/* Add Gas to Signer Wallet Panel */}
+        {showAddGasPanel && (
+          <div className="mt-3 p-3.5 rounded-xl bg-amber-950/25 border border-amber-500/40 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-amber-300 text-xs font-mono font-bold">
+                <Fuel className="h-4 w-4 shrink-0" />
+                <span>Add Gas ({EVM_CHAINS.find((c) => c.id === chain)?.label || chain})</span>
+              </div>
+              <div className="flex items-center gap-2">
+                {signerGasInfo && (
+                  <span
+                    className={`text-[10px] font-mono px-2 py-0.5 rounded-full border font-bold ${
+                      Number(signerGasInfo.balanceFormatted) > 0
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    }`}
+                  >
+                    Live Gas Balance: {Number(signerGasInfo.balanceFormatted).toFixed(6)} {signerGasInfo.nativeSymbol}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void refreshSignerGasInfo(gasTargetAddress)}
+                  disabled={loadingSignerGas}
+                  className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[10px] font-mono text-cyan-300 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3 w-3 ${loadingSignerGas ? 'animate-spin' : ''}`} />
+                  <span>Check Arrival</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 font-mono">
+              <div className="sm:col-span-2 space-y-1">
+                <label className="block text-[10px] uppercase text-slate-400">
+                  Target Signer Wallet to Fund (0x...)
+                </label>
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={gasTargetAddress}
+                    onChange={(e) => setGasTargetAddress(e.target.value)}
+                    placeholder="0x... Signer Address (auto-filled from Vault Signer Key)"
+                    className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-amber-400"
+                  />
+                  {gasTargetAddress.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(gasTargetAddress.trim());
+                        setCopiedSignerAddr(true);
+                        setTimeout(() => setCopiedSignerAddr(false), 1800);
+                      }}
+                      className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs text-slate-300 flex items-center gap-1 cursor-pointer"
+                      title="Copy Signer Deposit Address"
+                    >
+                      {copiedSignerAddr ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                      <span className="text-[10px]">{copiedSignerAddr ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] uppercase text-slate-400">
+                    Gas Amount ({signerGasInfo?.nativeSymbol || 'ETH'})
+                  </label>
+                  <div className="flex gap-1">
+                    {(chain === 'ethereum' ? ['0.002', '0.005', '0.01'] : ['0.0005', '0.002', '0.01']).map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => setGasTopUpAmount(preset)}
+                        className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 cursor-pointer"
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <input
+                  type="text"
+                  value={gasTopUpAmount}
+                  onChange={(e) => setGasTopUpAmount(e.target.value)}
+                  placeholder="0.002"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-amber-400"
+                />
+              </div>
+            </div>
+
+            {signerGasInfo && (
+              <div className="text-[10px] font-mono text-slate-400 flex flex-wrap items-center gap-3">
+                <span>Network Gas: <b className="text-slate-200">{signerGasInfo.gasPriceGwei} Gwei</b></span>
+                <span>Recommended Top-Up: <b className="text-amber-300">{signerGasInfo.recommendedTopUp} {signerGasInfo.nativeSymbol}</b></span>
+                {signerGasInfo.serverSignerAddress && (
+                  <span>
+                    Server Gas Wallet ({signerGasInfo.serverSignerAddress.slice(0, 6)}...{signerGasInfo.serverSignerAddress.slice(-4)}):{' '}
+                    <b className="text-cyan-300">{Number(signerGasInfo.serverSignerBalanceFormatted).toFixed(6)} {signerGasInfo.nativeSymbol}</b>
+                  </span>
+                )}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 pt-0.5 font-mono text-[10px]">
+              <button
+                type="button"
+                onClick={handleFundGasViaWeb3}
+                disabled={fundingGasMode !== null}
+                className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-all"
+              >
+                {fundingGasMode === 'WEB3' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wallet className="h-3.5 w-3.5" />}
+                <span>Send {gasTopUpAmount || '0'} {signerGasInfo?.nativeSymbol || 'ETH'} via MetaMask / Web3</span>
+              </button>
+
+              {signerGasInfo?.hasServerFundingSigner && (
+                <button
+                  type="button"
+                  onClick={handleFundGasFromServerWallet}
+                  disabled={fundingGasMode !== null || !signerGasInfo.canServerFund}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200 font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-50 transition-all"
+                  title={
+                    signerGasInfo.canServerFund
+                      ? 'Broadcast real gas funding tx from configured server Gas Wallet'
+                      : 'Server Gas Wallet needs more native gas balance on this network first'
+                  }
+                >
+                  {fundingGasMode === 'SERVER' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Fuel className="h-3.5 w-3.5" />}
+                  <span>Fund from Server Gas Wallet</span>
+                </button>
+              )}
+
+              <span className="text-[10px] font-sans text-slate-400 self-center">
+                Or withdraw {signerGasInfo?.nativeSymbol || 'ETH'} from Kraken / Coinbase directly to the target address above, then click <b>Check Arrival</b>.
+              </span>
+            </div>
+
+            {gasFundError && (
+              <div className="p-2 rounded-lg bg-rose-950/60 border border-rose-500/40 text-[11px] text-rose-200 font-mono">
+                {gasFundError}
+              </div>
+            )}
+            {gasFundNotice && (
+              <div className="p-2 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-[11px] text-emerald-200 font-mono">
+                {gasFundNotice}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {error && (
@@ -695,6 +1147,17 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
                 Under the EVM protocol, network gas is strictly deducted from the <b>sender (Vault/Signer)</b> before execution. Destination accounts (like Kraken or exchange deposit wallets) only receive assets and cannot be charged for incoming transfers.
               </p>
               <div className="flex flex-wrap gap-2 pt-1 font-mono text-[10px]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAddGasPanel(true);
+                    void refreshSignerGasInfo(gasTargetAddress);
+                  }}
+                  className="px-2.5 py-1 rounded bg-amber-500/25 hover:bg-amber-500/35 border border-amber-400/60 text-amber-200 font-bold flex items-center gap-1 cursor-pointer transition-all"
+                >
+                  <Fuel className="h-3 w-3" />
+                  <span>⛽ Add Gas to Signer Wallet</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -728,6 +1191,27 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
               </div>
             </div>
           )}
+
+          {(/does not match|smart contract|reverted|allowance/i.test(error)) &&
+            signerGasInfo?.signerAddress &&
+            signerGasInfo.signerAddress.toLowerCase() !== (vaultBalances?.vaultAddress || activeVaultAddress).toLowerCase() && (
+              <div className="pt-2 border-t border-rose-500/20 text-[11px] font-sans space-y-2">
+                <p className="text-[10px] text-slate-300 leading-relaxed">
+                  Your active signer key controls <code className="text-cyan-300 font-mono">{signerGasInfo.signerAddress}</code> (gas balance: {Number(signerGasInfo.balanceFormatted).toFixed(6)} {signerGasInfo.nativeSymbol}), whereas the selected source is <code className="text-amber-300 font-mono">{vaultBalances?.vaultAddress || activeVaultAddress}</code>.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setVaultSourceMode('CUSTOM');
+                    setCustomVaultAddress(signerGasInfo.signerAddress);
+                    setError(null);
+                  }}
+                  className="px-2.5 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/50 text-cyan-200 font-mono text-[10px] font-bold cursor-pointer transition-all"
+                >
+                  Switch Source Wallet to Signer ({signerGasInfo.signerAddress.slice(0, 6)}...{signerGasInfo.signerAddress.slice(-4)})
+                </button>
+              </div>
+            )}
         </div>
       )}
 
@@ -761,6 +1245,22 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
           </div>
         </div>
       )}
+
+      {/* Automated Contract Ownership & Rescue / Sweep Recovery Agent */}
+      <ContractRescueAgentPanel
+        chain={chain}
+        activeContractAddress={
+          vaultSourceMode === 'DEPLOYED_CONTRACT' || vaultBalances?.isSmartContract
+            ? vaultBalances?.vaultAddress || activeVaultAddress
+            : vaultBalances?.knownContractForChain || activeVaultAddress
+        }
+        defaultProfitWallet={vaultBalances?.profitVaultDefault || ''}
+        privateKey={sourcePrivateKey}
+        passphrase={sourcePassphrase}
+        onRecoveryComplete={() => {
+          void loadVaultBalances();
+        }}
+      />
 
       {/* Transfer Form */}
       <form onSubmit={handleSubmit} className="p-5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-4">
@@ -913,8 +1413,38 @@ export const VaultToExchangeTransfer: React.FC<VaultToExchangeTransferProps> = (
                     className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-amber-400"
                   />
                 </div>
+                {signerGasInfo?.signerAddress && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-slate-950 border border-slate-800 text-[10px]">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-slate-400">Derived Signer:</span>
+                      <span className="text-cyan-300 font-bold truncate select-all">{signerGasInfo.signerAddress}</span>
+                      {signerGasInfo.signerAddress.toLowerCase() === (vaultBalances?.vaultAddress || activeVaultAddress).toLowerCase() ? (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold">
+                          MATCHES SOURCE
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
+                          ≠ DIFFERS FROM VAULT
+                        </span>
+                      )}
+                    </div>
+                    {signerGasInfo.signerAddress.toLowerCase() !== (vaultBalances?.vaultAddress || activeVaultAddress).toLowerCase() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setVaultSourceMode('CUSTOM');
+                          setCustomVaultAddress(signerGasInfo.signerAddress);
+                          setError(null);
+                        }}
+                        className="px-2 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-400/40 font-bold cursor-pointer"
+                      >
+                        Use Signer as Source Wallet
+                      </button>
+                    )}
+                  </div>
+                )}
                 <p className="text-[10px] text-slate-400 font-sans">
-                  💡 A private key can only broadcast on-chain if it controls the source vault and holds gas ETH on {EVM_CHAINS.find((c) => c.id === chain)?.label || chain}. To sign directly from your browser without exposing keys, leave this blank and use MetaMask / Rabby.
+                  💡 A private key can only broadcast on-chain if it controls the source vault (or holds ERC-20 <code className="text-cyan-300 font-mono">transferFrom</code> allowance) and holds gas ETH on {EVM_CHAINS.find((c) => c.id === chain)?.label || chain}. To sign directly from your browser without exposing keys, leave this blank and use MetaMask / Rabby.
                 </p>
               </div>
             )}

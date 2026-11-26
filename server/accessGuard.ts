@@ -5,6 +5,7 @@ import crypto from 'crypto';
 
 export const OPEN_API_PATHS: RegExp[] = [
   /^\/api\/health$/,
+  /^\/api\/flash-arb\/gas-estimate$/,
   /^\/api\/fiat\/stripe\/webhook$/, // authenticated by Stripe's signature inside the handler
   /^\/api\/fiat\/paypal\/webhook$/, // authenticated by PayPal's signature inside the handler
   /^\/api\/user\//, // Firebase-authed (requireAuth)
